@@ -1,4 +1,10 @@
-"""Tests for modules.processor."""
+"""Tests for modules.processor.
+
+If a test here fails, check the code FIRST but the test's arithmetic
+SECOND: statistics are computed live from the passage texts, so the expected
+number in an assertion must be reproducible by hand from the passages given
+in the test.
+"""
 
 from modules import processor
 
@@ -39,7 +45,21 @@ def test_document_statistics_counts_types():
     assert stats["heading_count"] == 1
     assert stats["paragraph_count"] == 1
     assert stats["list_item_count"] == 1
-    assert stats["word_count"] == 5  # "title ichhamati nodi shanto chilo" equivalents
+    # Tokens: "title" + "ইছামতী" + "নদী" + "শান্ত" + "ছিল" + "item" = 6.
+    # The code_block passage is excluded by analysable_text().
+    assert stats["word_count"] == 6
+
+
+def test_document_statistics_excludes_code_blocks():
+    """Code blocks are not prose: they must not contribute word counts."""
+    passages = [
+        {"passage_type": "paragraph", "plain_text": "one two three"},
+        {"passage_type": "code_block", "plain_text": "for i in range(3):"},
+    ]
+    stats = processor.document_statistics("one two three\n\n```\nfor i in range(3):\n```\n",
+                                          passages)
+    assert stats["word_count"] == 3
+    assert stats["code_block_count"] == 1
 
 
 def test_search_is_case_insensitive_by_default():
