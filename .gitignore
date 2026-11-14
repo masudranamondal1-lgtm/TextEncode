@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Application data (never commit research data or databases)
+*.db
+*.sqlite
+*.sqlite3
+exports/*
+!exports/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
