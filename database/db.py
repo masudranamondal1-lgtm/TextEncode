@@ -3,18 +3,6 @@
 One module, one job: create the schema, generate stable IDs, and read/write
 records. No parsing and no Streamlit code lives here, so everything in this
 module is testable without a browser.
-
-Notes for future maintenance
-----------------------------
-* ``PRAGMA foreign_keys = ON`` is set on every connection. SQLite does not
-  remember it per database file; forgetting it silently disables CASCADE.
-* Schema versioning uses ``PRAGMA user_version``: 0 means "empty database,
-  create it"; 1 means "current"; anything else refuses to start rather than
-  corrupt data.
-* ID generation reads MAX(<id>) from the table. Zero-padded fixed-width IDs
-  sort correctly as text ("DOC-010" > "DOC-009"). This is safe for a
-  single-user local application; a multi-user version would need a lock or a
-  counters table.
 """
 
 from __future__ import annotations
@@ -377,3 +365,145 @@ def database_stats(conn) -> dict:
         key: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         for key, table in tables.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# Entities
+# ---------------------------------------------------------------------------
+
+def get_categories(conn) -> list[sqlite3.Row]:
+    """Return all entity categories."""
+    return conn.execute(
+        "SELECT category_id, name, description FROM entity_categories ORDER BY category_id"
+    ).fetchall()
+
+
+def save_entity(conn, *, canonical_name: str, category_id: int,
+                alt_names: str | None = None, transliteration: str | None = None,
+                description: str | None = None, notes: str | None = None,
+                doc_id: str | None = None) -> str:
+    """Insert a new entity and return its new ENT- ID."""
+    entity_id = next_entity_id(conn)
+    conn.execute(
+        "INSERT INTO entities (entity_id, canonical_name, category_id, alt_names, "
+        "transliteration, description, notes, doc_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (entity_id, canonical_name, category_id, alt_names, transliteration,
+         description, notes, doc_id, utc_now())
+    )
+    return entity_id
+
+
+def get_entities(conn) -> list[sqlite3.Row]:
+    """Return all entities joined with their category name."""
+    return conn.execute(
+        "SELECT e.entity_id, e.canonical_name, c.name as category, "
+        "e.alt_names, e.transliteration, e.description, e.notes, e.doc_id, e.created_at "
+        "FROM entities e "
+        "JOIN entity_categories c ON e.category_id = c.category_id "
+        "ORDER BY e.entity_id"
+    ).fetchall()
+
+
+def update_entity(conn, entity_id: str, *, canonical_name: str, category_id: int,
+                  alt_names: str | None, transliteration: str | None,
+                  description: str | None, notes: str | None) -> None:
+    """Update an existing entity's details. The entity_id never changes."""
+    conn.execute(
+        "UPDATE entities SET canonical_name = ?, category_id = ?, alt_names = ?, "
+        "transliteration = ?, description = ?, notes = ? WHERE entity_id = ?",
+        (canonical_name, category_id, alt_names, transliteration,
+         description, notes, entity_id)
+    )
+
+
+def delete_entity(conn, entity_id: str) -> None:
+    """Delete an entity. Mentions cascade."""
+    conn.execute("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+
+
+# ---------------------------------------------------------------------------
+# Mentions
+# ---------------------------------------------------------------------------
+
+def save_mention(conn, *, entity_id: str, doc_id: str, passage_id: str,
+                 surface_form: str, note: str | None = None,
+                 status: str = 'verified') -> str:
+    """Record a new occurrence of an entity in a specific passage."""
+    mention_id = next_mention_id(conn)
+    # We leave char_start and char_end as NULL for passage-level mentions
+    conn.execute(
+        "INSERT INTO mentions (mention_id, entity_id, doc_id, passage_id, "
+        "surface_form, status, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (mention_id, entity_id, doc_id, passage_id, surface_form, status, note, utc_now())
+    )
+    return mention_id
+
+
+def get_mentions(conn) -> list[sqlite3.Row]:
+    """Return all mentions joined with their entity and passage details."""
+    return conn.execute(
+        "SELECT m.mention_id, m.surface_form, m.status, m.note, m.created_at, "
+        "e.entity_id, e.canonical_name, c.name as category, "
+        "p.passage_id, p.plain_text, p.doc_id "
+        "FROM mentions m "
+        "JOIN entities e ON m.entity_id = e.entity_id "
+        "JOIN entity_categories c ON e.category_id = c.category_id "
+        "JOIN passages p ON m.passage_id = p.passage_id "
+        "ORDER BY m.mention_id DESC"
+    ).fetchall()
+
+
+def delete_mention(conn, mention_id: str) -> None:
+    """Delete a mention. The underlying entity and passage remain intact."""
+    conn.execute("DELETE FROM mentions WHERE mention_id = ?", (mention_id,))
+
+
+# ---------------------------------------------------------------------------
+# Relationships
+# ---------------------------------------------------------------------------
+
+def get_relationship_types(conn) -> list[sqlite3.Row]:
+    """Return all relationship types."""
+    return conn.execute(
+        "SELECT type_id, name, description, directed FROM relationship_types ORDER BY type_id"
+    ).fetchall()
+
+
+def save_relationship(conn, *, source_entity_id: str, target_entity_id: str,
+                      type_id: int, description: str | None = None,
+                      evidence_passage_id: str | None = None,
+                      doc_id: str | None = None, note: str | None = None,
+                      confidence: str | None = None) -> str:
+    """Record a new relationship between two entities."""
+    relationship_id = next_relationship_id(conn)
+    conn.execute(
+        "INSERT INTO relationships (relationship_id, source_entity_id, target_entity_id, "
+        "type_id, description, evidence_passage_id, doc_id, note, confidence, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (relationship_id, source_entity_id, target_entity_id, type_id,
+         description, evidence_passage_id, doc_id, note, confidence, utc_now())
+    )
+    return relationship_id
+
+
+def get_relationships(conn) -> list[sqlite3.Row]:
+    """Return all relationships joined with entity names and passage details."""
+    return conn.execute(
+        "SELECT r.relationship_id, r.source_entity_id, s.canonical_name as source_name, "
+        "r.target_entity_id, t.canonical_name as target_name, "
+        "rt.name as relationship_type, r.description, r.confidence, "
+        "r.evidence_passage_id, p.plain_text as evidence_text "
+        "FROM relationships r "
+        "JOIN entities s ON r.source_entity_id = s.entity_id "
+        "JOIN entities t ON r.target_entity_id = t.entity_id "
+        "JOIN relationship_types rt ON r.type_id = rt.type_id "
+        "LEFT JOIN passages p ON r.evidence_passage_id = p.passage_id "
+        "ORDER BY r.relationship_id DESC"
+    ).fetchall()
+
+
+def delete_relationship(conn, relationship_id: str) -> None:
+    """Delete a relationship. The underlying entities remain intact."""
+    conn.execute("DELETE FROM relationships WHERE relationship_id = ?", (relationship_id,))

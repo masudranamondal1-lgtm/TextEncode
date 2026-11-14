@@ -3,9 +3,6 @@
 Run from the project root:
 
     streamlit run app.py
-
-Stage 1 pages: Dashboard, Import Documents, Document Reader, Text Statistics,
-Keyword Search, Settings. Entity/mention/relationship pages arrive in Stage 2.
 """
 
 from __future__ import annotations
@@ -62,7 +59,7 @@ def page_dashboard() -> None:
     st.title("TextEncode")
     st.caption(
         "Markdown text processing, annotation and encoding for Digital "
-        "Humanities research. Stage 1: document import and text processing."
+        "Humanities research."
     )
 
     with db.get_connection() as conn:
@@ -87,7 +84,7 @@ def page_dashboard() -> None:
             hide_index=True,
         )
 
-    with st.expander("Current limitations (read before using the statistics)"):
+    with st.expander("Current limitations"):
         st.markdown(
             "- Word counts are **approximate**: tokens are split on whitespace "
             "and edge punctuation is trimmed. Bengali compounds and sandhi forms "
@@ -96,8 +93,7 @@ def page_dashboard() -> None:
             "- Markdown is parsed as **CommonMark**: GFM tables are not yet "
             "supported.\n"
             "- A changed file is imported as a **new document** (new DOC id). "
-            "Annotations never move to different text silently.\n"
-            "- Entity, mention and relationship registration arrives in Stage 2."
+            "Annotations never move to different text silently."
         )
 
 
@@ -121,8 +117,6 @@ def page_import() -> None:
         "Language for this batch (optional)", placeholder="e.g. Bengali"
     )
 
-    # Parse everything once per rerun: parsing is pure and fast, so no
-    # session_state juggling is needed.
     parsed = []
     for uploaded_file in uploaded:
         try:
@@ -216,7 +210,7 @@ def page_import() -> None:
             except db.DuplicateDocumentError as exc:
                 results.append({"file": name, "result": "duplicate",
                                 "detail": str(exc)})
-            except Exception as exc:  # noqa: BLE001 - surface any failure
+            except Exception as exc:
                 results.append({"file": name, "result": "error",
                                 "detail": str(exc)})
 
@@ -300,8 +294,8 @@ def page_reader() -> None:
 
     with st.expander("Danger zone: delete this document"):
         st.write(
-            "Deleting a document also deletes its passages and (once Stage 2 "
-            "exists) its mentions. This cannot be undone."
+            "Deleting a document also deletes its passages and any mentions "
+            "linked to them. This cannot be undone."
         )
         confirm = st.checkbox(
             f"I understand and want to delete {document['doc_id']}",
@@ -329,14 +323,13 @@ def page_statistics() -> None:
     )
 
     if scope == "All documents":
-        source_text = "\n\n".join(
-            d["source_text"] for d in
-            (db.get_document(conn, d["doc_id"]) for d in documents)
-        ) if False else None  # placeholder; replaced below
         with db.get_connection() as conn:
             source_text = "\n\n".join(
-                row["source_text"]
-                for row in (db.get_document(conn, d["doc_id"]) for d in documents)
+                conn.execute(
+                    "SELECT source_text FROM documents WHERE doc_id = ?",
+                    (d["doc_id"],),
+                ).fetchone()[0]
+                for d in documents
             )
         passages = all_passages
     else:
@@ -361,7 +354,7 @@ def page_statistics() -> None:
 
     st.caption(
         "Word and sentence counts are approximate: whitespace tokenisation and "
-        "। . ! ? sentence splitting. See the limitations note on the Dashboard."
+        "। . ! ? sentence splitting."
     )
 
     st.subheader("Word frequency")
@@ -386,7 +379,7 @@ def page_statistics() -> None:
 def page_search() -> None:
     st.header("Keyword Search")
     st.caption("Search runs on the readable passage text. Matches are suggestions "
-               "only; Stage 2 will let you verify them as mentions.")
+               "only; use Mention Registration to verify them.")
 
     with db.get_connection() as conn:
         documents = db.list_documents(conn)
@@ -447,6 +440,350 @@ def page_search() -> None:
                 st.write(snippet)
 
 
+def page_entities() -> None:
+    st.header("Entity Registration")
+    st.write(
+        "Register the concepts, people, places and things you find in your "
+        "documents. Remember: an Entity is the concept (e.g., 'ইছামতী'), "
+        "not the specific occurrences in the text."
+    )
+
+    with db.get_connection() as conn:
+        categories = db.get_categories(conn)
+        documents = db.list_documents(conn)
+        entities = db.get_entities(conn)
+
+    cat_options = {c["name"]: c["category_id"] for c in categories}
+    doc_options = {"None": None}
+    doc_options.update({f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents})
+
+    tab_add, tab_manage = st.tabs(["➕ Register New Entity", "📋 Manage Entities"])
+
+    # --- TAB 1: ADD ENTITY ---
+    with tab_add:
+        with st.form("add_entity_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            canonical_name = col1.text_input("Canonical Name *", placeholder="e.g. ইছামতী")
+            category_name = col2.selectbox("Category *", list(cat_options.keys()))
+            
+            col3, col4 = st.columns(2)
+            alt_names = col3.text_input("Alternative Names / Spellings", placeholder="Comma separated")
+            transliteration = col4.text_input("Transliteration", placeholder="e.g. Ichhamati")
+            
+            description = st.text_area("Description")
+            notes = st.text_area("Research Notes")
+            
+            assoc_doc = st.selectbox("Associated Document (Optional)", list(doc_options.keys()))
+            
+            submitted = st.form_submit_button("Save Entity", type="primary")
+            
+            if submitted:
+                if not canonical_name.strip():
+                    st.error("Canonical Name is required.")
+                else:
+                    try:
+                        with db.get_connection() as conn:
+                            new_id = db.save_entity(
+                                conn,
+                                canonical_name=canonical_name.strip(),
+                                category_id=cat_options[category_name],
+                                alt_names=alt_names.strip() or None,
+                                transliteration=transliteration.strip() or None,
+                                description=description.strip() or None,
+                                notes=notes.strip() or None,
+                                doc_id=doc_options[assoc_doc]
+                            )
+                        st.success(f"Entity saved successfully as {new_id}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error saving entity: {e}")
+
+    # --- TAB 2: MANAGE / EDIT ENTITIES ---
+    with tab_manage:
+        if not entities:
+            st.info("No entities registered yet.")
+        else:
+            entity_labels = {f"{e['entity_id']} — {e['canonical_name']} ({e['category']})": e for e in entities}
+            selected_label = st.selectbox("Select an entity to view or edit", list(entity_labels.keys()))
+            selected_entity = entity_labels[selected_label]
+
+            with st.form("edit_entity_form"):
+                st.subheader(f"Editing {selected_entity['entity_id']}")
+                
+                e_col1, e_col2 = st.columns(2)
+                e_name = e_col1.text_input("Canonical Name", value=selected_entity["canonical_name"])
+                
+                current_cat_index = list(cat_options.keys()).index(selected_entity["category"])
+                e_cat = e_col2.selectbox("Category", list(cat_options.keys()), index=current_cat_index)
+                
+                e_alt = st.text_input("Alternative Names", value=selected_entity["alt_names"] or "")
+                e_trans = st.text_input("Transliteration", value=selected_entity["transliteration"] or "")
+                e_desc = st.text_area("Description", value=selected_entity["description"] or "")
+                e_notes = st.text_area("Research Notes", value=selected_entity["notes"] or "")
+
+                col_save, col_del = st.columns([1, 1])
+                save_btn = col_save.form_submit_button("Update Entity", type="primary")
+                delete_btn = col_del.form_submit_button("Delete Entity", type="secondary")
+
+                if save_btn:
+                    with db.get_connection() as conn:
+                        db.update_entity(
+                            conn, selected_entity["entity_id"],
+                            canonical_name=e_name.strip(),
+                            category_id=cat_options[e_cat],
+                            alt_names=e_alt.strip() or None,
+                            transliteration=e_trans.strip() or None,
+                            description=e_desc.strip() or None,
+                            notes=e_notes.strip() or None
+                        )
+                    st.success("Entity updated.")
+                    st.rerun()
+
+                if delete_btn:
+                    with db.get_connection() as conn:
+                        db.delete_entity(conn, selected_entity["entity_id"])
+                    st.warning(f"Deleted {selected_entity['entity_id']}.")
+                    st.rerun()
+
+            st.divider()
+            st.subheader("All Registered Entities")
+            df = pd.DataFrame([dict(e) for e in entities])
+            st.dataframe(
+                df[["entity_id", "canonical_name", "category", "alt_names", "description"]], 
+                hide_index=True
+            )
+
+
+def page_mentions() -> None:
+    st.header("Mention Registration")
+    st.write(
+        "A Mention records exactly where an Entity appears in the text. "
+        "Select an entity, find the passage, and confirm the exact text."
+    )
+
+    with db.get_connection() as conn:
+        entities = db.get_entities(conn)
+        documents = db.list_documents(conn)
+        mentions = db.get_mentions(conn)
+
+    if not entities:
+        st.warning("You must register at least one Entity before you can add Mentions.")
+        return
+
+    tab_add, tab_view = st.tabs(["➕ Register Mention", "📋 View Mentions"])
+
+    # --- TAB 1: ADD MENTION ---
+    with tab_add:
+        entity_options = {f"{e['entity_id']} — {e['canonical_name']} ({e['category']})": e["entity_id"] for e in entities}
+        selected_entity_label = st.selectbox("1. Select Entity *", list(entity_options.keys()))
+        entity_id = entity_options[selected_entity_label]
+
+        doc_options = {f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents}
+        if not doc_options:
+            st.info("You need to import a document first.")
+            return
+        
+        selected_doc_label = st.selectbox("2. Select Document *", list(doc_options.keys()))
+        doc_id = doc_options[selected_doc_label]
+
+        with db.get_connection() as conn:
+            passages = db.get_passages(conn, doc_id)
+
+        if not passages:
+            st.warning("This document has no passages.")
+            return
+
+        passage_options = {
+            f"{p['passage_id']} (Chars {p['char_start']}-{p['char_end']}): {p['plain_text'][:60]}...": p["passage_id"]
+            for p in passages
+        }
+        selected_passage_label = st.selectbox("3. Select Passage *", list(passage_options.keys()))
+        passage_id = passage_options[selected_passage_label]
+
+        selected_passage = next(p for p in passages if p["passage_id"] == passage_id)
+        st.info(f"**Passage Text:**\n\n{selected_passage['plain_text']}")
+
+        with st.form("add_mention_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            surface_form = col1.text_input(
+                "Exact Text / Surface Form *", 
+                value=selected_entity_label.split(" — ")[1].split(" (")[0],
+                help="The exact spelling used in this specific passage."
+            )
+            note = col2.text_input("Research Note (optional)")
+            
+            submitted = st.form_submit_button("Save Mention", type="primary")
+            
+            if submitted:
+                if not surface_form.strip():
+                    st.error("Surface Form is required.")
+                else:
+                    try:
+                        with db.get_connection() as conn:
+                            new_id = db.save_mention(
+                                conn,
+                                entity_id=entity_id,
+                                doc_id=doc_id,
+                                passage_id=passage_id,
+                                surface_form=surface_form.strip(),
+                                note=note.strip() or None
+                            )
+                        st.success(f"Mention saved successfully as {new_id}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error saving mention: {e}")
+
+    # --- TAB 2: VIEW MENTIONS ---
+    with tab_view:
+        if not mentions:
+            st.info("No mentions registered yet.")
+        else:
+            df = pd.DataFrame([dict(m) for m in mentions])
+            
+            st.subheader("All Mentions")
+            st.dataframe(
+                df[["mention_id", "entity_id", "canonical_name", "surface_form", "passage_id", "plain_text"]],
+                hide_index=True,
+                column_config={
+                    "plain_text": st.column_config.TextColumn("Context", width="large")
+                }
+            )
+
+            st.divider()
+            st.subheader("Delete a Mention")
+            del_label = st.selectbox(
+                "Select a mention to delete", 
+                df["mention_id"] + " — " + df["canonical_name"] + " in " + df["passage_id"]
+            )
+            if st.button("Delete Mention", type="secondary"):
+                mention_id = del_label.split(" — ")[0]
+                with db.get_connection() as conn:
+                    db.delete_mention(conn, mention_id)
+                st.warning(f"Deleted {mention_id}.")
+                st.rerun()
+
+
+def page_relationships() -> None:
+    st.header("Relationship Registration")
+    st.write(
+        "Connect two Entities with a specific relationship. "
+        "Always provide evidence from a passage to support your interpretation."
+    )
+
+    with db.get_connection() as conn:
+        entities = db.get_entities(conn)
+        documents = db.list_documents(conn)
+        rel_types = db.get_relationship_types(conn)
+        relationships = db.get_relationships(conn)
+
+    if len(entities) < 2:
+        st.warning("You need at least two Entities registered before you can create a Relationship.")
+        return
+
+    tab_add, tab_view = st.tabs(["➕ Register Relationship", "📋 View Relationships"])
+
+    # --- TAB 1: ADD RELATIONSHIP ---
+    with tab_add:
+        entity_options = {f"{e['entity_id']} — {e['canonical_name']} ({e['category']})": e["entity_id"] for e in entities}
+        rel_type_options = {f"{rt['name']} ({rt['description']})": rt["type_id"] for rt in rel_types}
+
+        col1, col2 = st.columns(2)
+        source_label = col1.selectbox("Source Entity *", list(entity_options.keys()))
+        target_label = col2.selectbox("Target Entity *", list(entity_options.keys()))
+        
+        source_id = entity_options[source_label]
+        target_id = entity_options[target_label]
+
+        rel_type_label = st.selectbox("Relationship Type *", list(rel_type_options.keys()))
+        type_id = rel_type_options[rel_type_label]
+
+        description = st.text_area("Description / Interpretation", placeholder="e.g. The fishing community relies on the river for their livelihood.")
+        confidence = st.selectbox("Confidence", ["Unspecified", "low", "medium", "high"])
+
+        # Evidence Passage (Optional but recommended)
+        st.subheader("Evidence (Optional)")
+        doc_options = {"None": None}
+        doc_options.update({f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents})
+        selected_doc_label = st.selectbox("Select Document", list(doc_options.keys()))
+        doc_id = doc_options[selected_doc_label]
+
+        evidence_passage_id = None
+        if doc_id:
+            with db.get_connection() as conn:
+                passages = db.get_passages(conn, doc_id)
+            
+            passage_options = {
+                f"{p['passage_id']}: {p['plain_text'][:60]}...": p["passage_id"]
+                for p in passages
+            }
+            # Add a "None" option for evidence
+            passage_options = {"None": None, **passage_options}
+            
+            selected_passage_label = st.selectbox("Select Evidence Passage", list(passage_options.keys()))
+            evidence_passage_id = passage_options[selected_passage_label]
+
+            if evidence_passage_id:
+                selected_passage = next(p for p in passages if p["passage_id"] == evidence_passage_id)
+                st.info(f"**Passage Text:**\n\n{selected_passage['plain_text']}")
+
+        if st.button("Save Relationship", type="primary"):
+            if source_id == target_id:
+                st.error("Source and Target entities must be different.")
+            elif not description.strip():
+                st.error("Please provide a description/interpretation.")
+            else:
+                try:
+                    with db.get_connection() as conn:
+                        new_id = db.save_relationship(
+                            conn,
+                            source_entity_id=source_id,
+                            target_entity_id=target_id,
+                            type_id=type_id,
+                            description=description.strip(),
+                            evidence_passage_id=evidence_passage_id,
+                            doc_id=doc_id,
+                            confidence=None if confidence == "Unspecified" else confidence
+                        )
+                    st.success(f"Relationship saved successfully as {new_id}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error saving relationship: {e}")
+
+    # --- TAB 2: VIEW RELATIONSHIPS ---
+    with tab_view:
+        if not relationships:
+            st.info("No relationships registered yet.")
+        else:
+            df = pd.DataFrame([dict(r) for r in relationships])
+            
+            st.subheader("All Relationships")
+            st.dataframe(
+                df[["relationship_id", "source_name", "relationship_type", "target_name", "confidence", "evidence_passage_id"]],
+                hide_index=True
+            )
+
+            st.divider()
+            st.subheader("Relationship Details")
+            rel_label = st.selectbox(
+                "Select a relationship to view details", 
+                df["relationship_id"] + " — " + df["source_name"] + " " + df["relationship_type"] + " " + df["target_name"]
+            )
+            rel_id = rel_label.split(" — ")[0]
+            selected_rel = next(r for r in relationships if r["relationship_id"] == rel_id)
+
+            st.write(f"**Description:** {selected_rel['description']}")
+            if selected_rel['evidence_text']:
+                st.info(f"**Evidence from {selected_rel['evidence_passage_id']}:**\n\n{selected_rel['evidence_text']}")
+            else:
+                st.caption("No evidence passage linked.")
+
+            if st.button("Delete Relationship", type="secondary"):
+                with db.get_connection() as conn:
+                    db.delete_relationship(conn, rel_id)
+                st.warning(f"Deleted {rel_id}.")
+                st.rerun()
+
+
 def page_settings() -> None:
     st.header("Settings")
     st.write(f"**Database file:** `{DB_FILE}`")
@@ -475,7 +812,7 @@ def page_settings() -> None:
             "- Passage offsets are Python string indices (Unicode code points) "
             "into `documents.source_text`; "
             "`source_text[char_start:char_end] == passages.text` is guaranteed.\n"
-            "- Mention offsets (Stage 2) are relative to `passages.text`.\n"
+            "- Mention offsets are relative to `passages.text`.\n"
             "- Identical files are refused; changed files become new documents."
         )
 
@@ -486,12 +823,15 @@ PAGES = {
     "Document Reader": page_reader,
     "Text Statistics": page_statistics,
     "Keyword Search": page_search,
+    "Entity Registration": page_entities,
+    "Mention Registration": page_mentions,
+    "Relationship Registration": page_relationships,
     "Settings": page_settings,
 }
 
 with st.sidebar:
     st.markdown("### 📖 TextEncode")
     choice = st.radio("Navigation", list(PAGES))
-    st.caption("Stage 1 · documents & passages")
+    st.caption("Stage 2 · annotation & data")
 
 PAGES[choice]()
