@@ -21,7 +21,7 @@ import pandas as pd
 import streamlit as st
 
 from database import db
-from modules import parser, processor
+from modules import parser, processor, exporter
 
 PAGE_SIZE = 25
 
@@ -784,6 +784,62 @@ def page_relationships() -> None:
                 st.rerun()
 
 
+def page_export() -> None:
+    st.header("Export Data")
+    st.write(
+        "Export your structured research data. The CSV and JSON files contain "
+        "the raw database tables. The TEI XML export creates a standards-based "
+        "text encoding with your entities linked to their passages."
+    )
+
+    with db.get_connection() as conn:
+        documents = db.list_documents(conn)
+
+    if not documents:
+        st.info("No data to export yet. Import and annotate a document first.")
+        return
+
+    # --- CSV & JSON EXPORTS ---
+    with db.get_connection() as conn:
+        # JSON Export
+        combined_json = exporter.generate_json_export(conn)
+        st.download_button(
+            "Download Complete Dataset (JSON)",
+            data=combined_json.encode("utf-8"),
+            file_name="textencode_dataset.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # --- TEI XML EXPORT ---
+    st.subheader("TEI P5 XML Export")
+    st.caption(
+        "⚠️ **Note:** This is a basic TEI-compatible export. It uses inline "
+        "tags (e.g., `<persName>`) and a `<standOff>` for entity lists. It is "
+        "*not* strictly schema-validated against the full TEI ODD."
+    )
+
+    doc_options = {f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents}
+    selected_doc_label = st.selectbox("Select a document to encode as TEI", list(doc_options.keys()))
+    
+    if st.button("Generate TEI XML"):
+        doc_id = doc_options[selected_doc_label]
+        with db.get_connection() as conn:
+            xml_string = exporter.generate_tei_xml(conn, doc_id)
+        
+        st.download_button(
+            "Download TEI XML",
+            data=xml_string.encode("utf-8"),
+            file_name=f"textencode_{doc_id}.xml",
+            mime="application/xml"
+        )
+        
+        with st.expander("Preview XML"):
+            st.code(xml_string, language="xml")
+
+
 def page_settings() -> None:
     st.header("Settings")
     st.write(f"**Database file:** `{DB_FILE}`")
@@ -826,12 +882,13 @@ PAGES = {
     "Entity Registration": page_entities,
     "Mention Registration": page_mentions,
     "Relationship Registration": page_relationships,
+    "Export Data": page_export,
     "Settings": page_settings,
 }
 
 with st.sidebar:
     st.markdown("### 📖 TextEncode")
     choice = st.radio("Navigation", list(PAGES))
-    st.caption("Stage 2 · annotation & data")
+    st.caption("Stage 3 · exports & TEI")
 
 PAGES[choice]()
