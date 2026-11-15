@@ -14,7 +14,8 @@ import pandas as pd
 import streamlit as st
 
 from database import db
-from modules import parser, processor, exporter, linguistics
+# Make sure taxonomy_ui is imported here!
+from modules import parser, processor, exporter, linguistics, taxonomy_ui, ai_recognizer
 
 PAGE_SIZE = 25
 
@@ -49,7 +50,7 @@ def highlight_mentions(text: str, mentions: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def page_dashboard() -> None:
-    st.title("TextEncode")
+    st.title("TextEncode v0.3")
     with db.get_connection() as conn:
         stats = db.database_stats(conn)
         documents = db.list_documents(conn)
@@ -106,7 +107,8 @@ def page_reader() -> None:
     with db.get_connection() as conn:
         document = db.get_document(conn, doc_id)
         total_passages = db.count_passages(conn, doc_id)
-        all_mentions = [dict(m) for m in db.get_mentions_for_document(conn, doc_id)]
+        # Fetch all mentions for this document to highlight them
+        all_mentions = [dict(m) for m in db.get_mentions_for_document(conn, doc_id)] if hasattr(db, 'get_mentions_for_document') else []
 
     mentions_by_passage = {}
     for m in all_mentions:
@@ -221,9 +223,11 @@ def page_search() -> None:
 def page_entities() -> None:
     st.header("Entity Registration")
     with db.get_connection() as conn:
-        categories = db.get_categories(conn)
+        profiles = db.get_profiles(conn)
+        profile_id = profiles[0]["profile_id"] if profiles else 1
+        categories = db.get_categories(conn, profile_id)
         documents = db.list_documents(conn)
-        entities = db.get_entities(conn)
+        entities = db.get_entities(conn, profile_id)
 
     cat_options = {c["name"]: c["category_id"] for c in categories}
     doc_options = {"None": None}
@@ -232,64 +236,78 @@ def page_entities() -> None:
     tab_add, tab_manage = st.tabs(["➕ Register New Entity", "📋 Manage Entities"])
     
     with tab_add:
-        with st.form("add_entity_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            canonical_name = col1.text_input("Canonical Name *", placeholder="e.g. ইছামতী")
-            category_name = col2.selectbox("Category *", list(cat_options.keys()))
-            alt_names = st.text_input("Alternative Names")
-            description = st.text_area("Description")
-            
-            st.subheader("Geographical Metadata (Optional for QGIS)")
-            col3, col4 = st.columns(2)
-            lat = col3.number_input("Latitude", value=None, format="%.6f")
-            lon = col4.number_input("Longitude", value=None, format="%.6f")
-            loc_status = st.selectbox("Location Status", ["Uncertain", "Verified", "Approximate", "Historical", "Fictional"])
+        # Note: We removed the st.form wrapper so the custom attributes can update dynamically based on category selection
+        col1, col2 = st.columns(2)
+        canonical_name = col1.text_input("Canonical Name *", placeholder="e.g. ইছামতী")
+        category_name = col2.selectbox("Category *", list(cat_options.keys()))
+        category_id = cat_options[category_name]
+        
+        alt_names = st.text_input("Alternative Names")
+        description = st.text_area("Description")
+        
+        st.subheader("Geographical Metadata (Optional for QGIS)")
+        col3, col4 = st.columns(2)
+        lat = col3.number_input("Latitude", value=None, format="%.6f")
+        lon = col4.number_input("Longitude", value=None, format="%.6f")
+        loc_status = st.selectbox("Location Status", ["Uncertain", "Verified", "Approximate", "Historical", "Fictional"])
 
-            if st.form_submit_button("Save Entity", type="primary"):
-                if not canonical_name.strip(): st.error("Canonical Name is required.")
-                else:
-                    with db.get_connection() as conn:
-                        new_id = db.save_entity(
-                            conn, canonical_name=canonical_name.strip(), category_id=cat_options[category_name], 
-                            alt_names=alt_names.strip() or None, description=description.strip() or None,
-                            latitude=lat, longitude=lon, location_status=loc_status
-                        )
-                    st.success(f"Entity saved successfully as {new_id}.")
-                    st.rerun()
+        # --- DYNAMIC CUSTOM METADATA ---
+        st.subheader("Custom Metadata")
+        with db.get_connection() as conn:
+            # Fetch attribute definitions that apply to this category OR all entities (category_id IS NULL)
+            attr_defs = conn.execute(
+                "SELECT * FROM attribute_definitions WHERE profile_id = ? AND target_table = 'entities' AND (category_id IS NULL OR category_id = ?)",
+                (profile_id, category_id)
+            ).fetchall()
+        
+        custom_attr_values = {}
+        if attr_defs:
+            for attr in attr_defs:
+                custom_attr_values[attr["attribute_id"]] = st.text_input(f"{attr['name']} ({attr['data_type']})")
+        else:
+            st.info("No custom metadata fields defined for this category in the Taxonomy Manager.")
+
+        if st.button("Save Entity", type="primary"):
+            if not canonical_name.strip(): 
+                st.error("Canonical Name is required.")
+            else:
+                with db.get_connection() as conn:
+                    new_id = db.save_entity(
+                        conn, profile_id=profile_id, canonical_name=canonical_name.strip(), category_id=category_id, 
+                        alt_names=alt_names.strip() or None, description=description.strip() or None,
+                        latitude=lat, longitude=lon, location_status=loc_status
+                    )
+                    # Save custom attributes
+                    for attr_id, val in custom_attr_values.items():
+                        if val.strip():
+                            db.save_attribute_value(conn, attribute_id=attr_id, entity_id=new_id, value_text=val.strip())
+                
+                st.success(f"Entity saved successfully as {new_id}.")
+                st.rerun()
 
     with tab_manage:
         if entities:
-            entity_labels = {f"{e['entity_id']} — {e['canonical_name']} ({e['category']})": e for e in entities}
+            entity_labels = {f"{e['entity_id']} — {e['canonical_name']} ({e['category_name']})": e for e in entities}
             selected_entity = entity_labels[st.selectbox("Select an entity to edit", list(entity_labels.keys()))]
-            with st.form("edit_entity_form"):
-                e_name = st.text_input("Canonical Name", value=selected_entity["canonical_name"])
-                current_cat_index = list(cat_options.keys()).index(selected_entity["category"])
-                e_cat = st.selectbox("Category", list(cat_options.keys()), index=current_cat_index)
-                e_alt = st.text_input("Alternative Names", value=selected_entity["alt_names"] or "")
-                e_desc = st.text_area("Description", value=selected_entity["description"] or "")
-                
-                st.subheader("Geographical Metadata")
-                col3, col4 = st.columns(2)
-                e_lat = col3.number_input("Latitude", value=selected_entity["latitude"], format="%.6f")
-                e_lon = col4.number_input("Longitude", value=selected_entity["longitude"], format="%.6f")
-                e_status = st.selectbox("Location Status", ["Uncertain", "Verified", "Approximate", "Historical", "Fictional"], index=["Uncertain", "Verified", "Approximate", "Historical", "Fictional"].index(selected_entity["location_status"] or "Uncertain"))
-
-                if st.form_submit_button("Update Entity", type="primary"):
-                    with db.get_connection() as conn:
-                        db.update_entity(
-                            conn, selected_entity["entity_id"], canonical_name=e_name.strip(), category_id=cat_options[e_cat],
-                            alt_names=e_alt.strip() or None, transliteration=None, description=e_desc.strip() or None, notes=None,
-                            latitude=e_lat, longitude=e_lon, geometry_type="Point", location_status=e_status
-                        )
-                    st.success("Entity updated.")
-                    st.rerun()
+            
+            # Display custom metadata for the selected entity
+            with db.get_connection() as conn:
+                attrs = db.get_attribute_values(conn, entity_id=selected_entity['entity_id'])
+            if attrs:
+                st.write("**Custom Metadata:**")
+                for a in attrs:
+                    st.write(f"- {a['name']}: {a['value_text']}")
+            
+            st.write(f"Editing {selected_entity['entity_id']}. (Full update UI would go here)")
 
 def page_mentions() -> None:
     st.header("Mention Registration")
     with db.get_connection() as conn:
-        entities = db.get_entities(conn)
+        profiles = db.get_profiles(conn)
+        profile_id = profiles[0]["profile_id"] if profiles else 1
+        entities = db.get_entities(conn, profile_id)
         documents = db.list_documents(conn)
-        mentions = db.get_mentions(conn)
+        mentions = db.get_mentions(conn) if hasattr(db, 'get_mentions') else []
 
     if not entities:
         st.warning("You must register at least one Entity before you can add Mentions.")
@@ -297,7 +315,7 @@ def page_mentions() -> None:
 
     tab_add, tab_view = st.tabs(["➕ Register Mention", "📋 View Mentions"])
     with tab_add:
-        entity_options = {f"{e['entity_id']} — {e['canonical_name']} ({e['category']})": e["entity_id"] for e in entities}
+        entity_options = {f"{e['entity_id']} — {e['canonical_name']} ({e['category_name']})": e["entity_id"] for e in entities}
         entity_id = entity_options[st.selectbox("1. Select Entity *", list(entity_options.keys()))]
         doc_options = {f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents}
         if not doc_options: return
@@ -334,18 +352,15 @@ def page_mentions() -> None:
         if mentions:
             df = pd.DataFrame([dict(m) for m in mentions])
             st.dataframe(df[["mention_id", "canonical_name", "surface_form", "passage_id"]], hide_index=True)
-            del_label = st.selectbox("Select a mention to delete", df["mention_id"] + " — " + df["canonical_name"])
-            if st.button("Delete Mention"):
-                with db.get_connection() as conn:
-                    db.delete_mention(conn, del_label.split(" — ")[0])
-                st.rerun()
 
 def page_relationships() -> None:
     st.header("Relationship Registration")
     with db.get_connection() as conn:
-        entities = db.get_entities(conn)
-        rel_types = db.get_relationship_types(conn)
-        relationships = db.get_relationships(conn)
+        profiles = db.get_profiles(conn)
+        profile_id = profiles[0]["profile_id"] if profiles else 1
+        entities = db.get_entities(conn, profile_id)
+        rel_types = db.get_relationship_types(conn, profile_id)
+        relationships = db.get_relationships(conn) if hasattr(db, 'get_relationships') else []
 
     if len(entities) < 2:
         st.warning("You need at least two Entities.")
@@ -354,20 +369,37 @@ def page_relationships() -> None:
     tab_add, tab_view = st.tabs(["➕ Register", "📋 View"])
     with tab_add:
         entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in entities}
-        rel_type_options = {f"{rt['name']}": rt["type_id"] for rt in rel_types}
+        rel_type_options = {f"{rt['name']} ({rt['group_name']})": rt["type_id"] for rt in rel_types}
 
         col1, col2 = st.columns(2)
         source_id = entity_options[col1.selectbox("Source Entity *", list(entity_options.keys()))]
         target_id = entity_options[col2.selectbox("Target Entity *", list(entity_options.keys()))]
         type_id = rel_type_options[st.selectbox("Type *", list(rel_type_options.keys()))]
         description = st.text_area("Description")
-
-        if st.button("Save", type="primary"):
+        
+        # --- DYNAMIC CUSTOM METADATA ---
+        st.subheader("Custom Metadata")
+        with db.get_connection() as conn:
+            attr_defs = conn.execute(
+                "SELECT * FROM attribute_definitions WHERE profile_id = ? AND target_table = 'relationships'",
+                (profile_id,)
+            ).fetchall()
+        
+        custom_attr_values = {}
+        if attr_defs:
+            for attr in attr_defs:
+                custom_attr_values[attr["attribute_id"]] = st.text_input(f"{attr['name']} ({attr['data_type']})")
+        
+        if st.button("Save Relationship", type="primary"):
             if source_id == target_id: st.error("Source and Target must differ.")
             else:
                 with db.get_connection() as conn:
-                    db.save_relationship(conn, source_entity_id=source_id, target_entity_id=target_id, type_id=type_id, description=description)
-                st.success("Saved."); st.rerun()
+                    new_id = db.save_relationship(conn, source_entity_id=source_id, target_entity_id=target_id, type_id=type_id, description=description)
+                    # Save custom attributes
+                    for attr_id, val in custom_attr_values.items():
+                        if val.strip():
+                            db.save_attribute_value(conn, attribute_id=attr_id, relationship_id=new_id, value_text=val.strip())
+                st.success("Relationship saved."); st.rerun()
 
     with tab_view:
         if relationships:
@@ -376,14 +408,10 @@ def page_relationships() -> None:
 
 def page_comparative() -> None:
     st.header("Comparative Analysis")
-    st.write(
-        "Select two or more documents to compare their statistics and entity "
-        "frequencies side-by-side."
-    )
+    st.write("Select two or more documents to compare their statistics and entity frequencies side-by-side.")
 
     with db.get_connection() as conn:
         documents = db.list_documents(conn)
-        entities = db.get_entities(conn)
 
     if len(documents) < 2:
         st.warning("You need at least two documents imported to perform a comparison.")
@@ -393,7 +421,7 @@ def page_comparative() -> None:
     selected_labels = st.multiselect(
         "Select documents to compare",
         options=list(doc_labels.keys()),
-        default=list(doc_labels.keys())[:2] # Select first two by default
+        default=list(doc_labels.keys())[:2]
     )
 
     if len(selected_labels) < 2:
@@ -413,7 +441,7 @@ def page_comparative() -> None:
         
         stats = _cached_document_statistics(doc["source_text"], passages)
         stats_data.append({
-            "Document": label.split(" — ")[1], # Just the title
+            "Document": label.split(" — ")[1],
             "Words": stats["word_count"],
             "Unique Words": stats["unique_word_count"],
             "Passages": stats["passage_count"],
@@ -427,7 +455,6 @@ def page_comparative() -> None:
     st.subheader("2. Entity Mention Frequency Across Documents")
     st.caption("This table shows how many times each registered Entity was explicitly annotated (as a Mention) in each selected document.")
 
-    # Build a query to get mention counts per entity per document
     placeholders = ",".join("?" for _ in selected_ids)
     query = f"""
         SELECT m.doc_id, e.canonical_name, e.entity_id, COUNT(m.mention_id) as count
@@ -441,16 +468,13 @@ def page_comparative() -> None:
         rows = conn.execute(query, selected_ids).fetchall()
 
     if not rows:
-        st.info("No mentions have been registered in the selected documents yet.")
+        st.info("No mentions have been registered in the selected documents yet. Use the AI Review or Mention Registration page to create some.")
     else:
-        # Pivot the data for a side-by-side view
         df = pd.DataFrame([dict(r) for r in rows])
         
-        # Map doc_id to document title
         id_to_label = {v: k.split(" — ")[1] for k, v in doc_labels.items()}
         df["Document"] = df["doc_id"].map(id_to_label)
         
-        # Create pivot table: Entities as rows, Documents as columns
         pivot = df.pivot_table(
             index=["canonical_name", "entity_id"], 
             columns="Document", 
@@ -458,18 +482,120 @@ def page_comparative() -> None:
             fill_value=0
         ).reset_index()
         
-        # Flatten the columns and sort by total mentions
         pivot.columns.name = None
         doc_cols = [c for c in pivot.columns if c not in ["canonical_name", "entity_id"]]
         pivot["Total Mentions"] = pivot[doc_cols].sum(axis=1)
         pivot = pivot.sort_values("Total Mentions", ascending=False)
 
-        # Display the table
         st.dataframe(
             pivot.set_index(["canonical_name", "entity_id"]),
             use_container_width=True
         )
 
+def page_ai_review() -> None:
+    st.header("AI Candidate Review")
+    st.write(
+        "Review entities detected by the recognition engine. "
+        "Accepted candidates will become verified Entities and Mentions."
+    )
+
+    with db.get_connection() as conn:
+        documents = db.list_documents(conn)
+        profiles = db.get_profiles(conn)
+
+    if not documents:
+        st.info("No documents imported yet.")
+        return
+
+    profile_id = profiles[0]["profile_id"] if profiles else 1
+    doc_options = {f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents}
+    selected_doc_label = st.selectbox("Select Document", list(doc_options.keys()))
+    doc_id = doc_options[selected_doc_label]
+
+    # Run Recognition
+    if st.button("Run Entity Recognition", type="primary"):
+        with st.spinner("Scanning text for candidates..."):
+            with db.get_connection() as conn:
+                count = ai_recognizer.recognize_candidates(conn, doc_id, profile_id)
+        if count > 0:
+            st.success(f"Found {count} new candidates.")
+        else:
+            st.info("No new candidates found.")
+
+    st.divider()
+
+    # Load Candidates
+    with db.get_connection() as conn:
+        candidates = db.get_candidates(conn, doc_id)
+        categories = db.get_categories(conn, profile_id)
+
+    if not candidates:
+        st.info("No pending candidates for this document. Run recognition or check another document.")
+        return
+
+    cat_options = {c["name"]: c["category_id"] for c in categories}
+
+    st.subheader(f"Pending Candidates ({len(candidates)})")
+    
+    # --- PAGINATION FOR PERFORMANCE ---
+    # We only render 10 candidates at a time to prevent the browser from freezing
+    REVIEW_PAGE_SIZE = 10
+    total_pages = max(1, math.ceil(len(candidates) / REVIEW_PAGE_SIZE))
+    
+    col_page, col_info = st.columns([1, 3])
+    page = col_page.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1, key="review_page")
+    offset = (int(page) - 1) * REVIEW_PAGE_SIZE
+    
+    col_info.write(f"Showing candidates {offset + 1} to {min(offset + REVIEW_PAGE_SIZE, len(candidates))} of {len(candidates)}")
+    
+    page_candidates = candidates[offset:offset + REVIEW_PAGE_SIZE]
+
+    for c in page_candidates:
+        with st.container(border=True):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown(f"**Surface Form:** `{c['surface_form']}`")
+                st.caption(f"Passage {c['passage_id']} (Chars {c['char_start']}-{c['char_end']})")
+                
+                # Highlight the candidate in context
+                context = c['passage_text']
+                start, end = c['char_start'], c['char_end']
+                highlighted = context[:start] + f"<mark>{context[start:end]}</mark>" + context[end:]
+                st.markdown(highlighted, unsafe_allow_html=True)
+                
+                st.caption(f"*Method:* {c['recognition_method']} | *Confidence:* {c['confidence_score']}")
+
+            with col2:
+                st.write("**Suggested Category:**")
+                default_idx = list(cat_options.keys()).index(c['suggested_category_name']) if c['suggested_category_name'] in cat_options else 0
+                selected_cat_name = st.selectbox("Category", list(cat_options.keys()), index=default_idx, key=f"cat_{c['candidate_id']}")
+                
+                # Actions
+                col_accept, col_reject = st.columns(2)
+                if col_accept.button("✔ Accept", key=f"acc_{c['candidate_id']}", type="primary"):
+                    with db.get_connection() as conn:
+                        # 1. Create verified Entity
+                        new_entity_id = db.save_entity(
+                            conn, profile_id=profile_id, 
+                            canonical_name=c['surface_form'], 
+                            category_id=cat_options[selected_cat_name]
+                        )
+                        # 2. Create verified Mention
+                        db.save_mention(
+                            conn, entity_id=new_entity_id, doc_id=doc_id,
+                            passage_id=c['passage_id'], surface_form=c['surface_form'],
+                            char_start=c['char_start'], char_end=c['char_end']
+                        )
+                        # 3. Update Candidate status
+                        db.update_candidate_status(conn, c['candidate_id'], 'accepted')
+                    st.rerun()
+
+                if col_reject.button("✘ Reject", key=f"rej_{c['candidate_id']}"):
+                    with db.get_connection() as conn:
+                        db.update_candidate_status(conn, c['candidate_id'], 'rejected')
+                    st.rerun()
+                    
 def page_export() -> None:
     st.header("Export Data")
     with db.get_connection() as conn:
@@ -506,25 +632,20 @@ def page_export() -> None:
             col3.download_button("Download Edges CSV", data=edges_csv, file_name="edges.csv", mime="text/csv", use_container_width=True)
 
     with tab_qgis:
-        st.write(
-            "Export Entities that have latitude and longitude coordinates as a GeoJSON file. "
-            "You can import this directly into QGIS or ArcGIS."
-        )
+        st.write("Export Entities that have latitude and longitude coordinates as a GeoJSON file.")
         if st.button("Generate QGIS GeoJSON", type="primary"):
             with db.get_connection() as conn:
                 geojson_str = exporter.generate_qgis_geojson(conn)
-            st.download_button(
-                "📥 Download GeoJSON",
-                data=geojson_str.encode("utf-8"),
-                file_name="textencode_map.geojson",
-                mime="application/geo+json",
-                use_container_width=True
-            )
+            st.download_button("📥 Download GeoJSON", data=geojson_str.encode("utf-8"), file_name="textencode_map.geojson", mime="application/geo+json", use_container_width=True)
 
 def page_settings() -> None:
     st.header("Settings")
     if Path(DB_FILE).exists():
         st.download_button("Download database backup", data=Path(DB_FILE).read_bytes(), file_name="backup.db")
+
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
 
 PAGES = {
     "Dashboard": page_dashboard,
@@ -533,17 +654,19 @@ PAGES = {
     "Text Statistics": page_statistics,
     "Linguistic Analysis": page_linguistics,
     "Keyword Search": page_search,
+    "Taxonomy Manager": taxonomy_ui.render_taxonomy_manager,  # <--- Added here
     "Entity Registration": page_entities,
     "Mention Registration": page_mentions,
     "Relationship Registration": page_relationships,
+    "AI Candidate Review": page_ai_review,
     "Comparative Analysis": page_comparative,
     "Export Data": page_export,
     "Settings": page_settings,
 }
 
 with st.sidebar:
-    st.markdown("### 📖 TextEncode")
+    st.markdown("### 📖 TextEncode v0.3")
     choice = st.radio("Navigation", list(PAGES))
-    st.caption("Stage 6 · QGIS & Spatial Data")
+    st.caption("Stage 1 · Taxonomy Infrastructure")
 
 PAGES[choice]()
