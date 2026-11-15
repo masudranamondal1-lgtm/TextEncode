@@ -1,30 +1,23 @@
 # TextEncode Roadmap
 
-## MVP (three-day assignment) — COMPLETED
+## MVP (v0.1) — COMPLETED
+- [x] Markdown import, parsing, and passage identification.
+- [x] Basic text statistics and keyword search.
+- [x] Entity, Mention, and Relationship registration.
+- [x] SQLite persistence.
+- [x] Basic JSON, CSV, and TEI XML export.
 
-- [x] Markdown import (UTF-8, multiple files, Bengali + English).
-- [x] Structure-aware parsing (headings, paragraphs, list items, block quotes).
-- [x] Stable document and passage IDs with character offsets.
-- [x] Text statistics and keyword search.
-- [x] SQLite database with 12 default entity categories and 16 relationship types.
-- [x] Entity registration with alternative names.
-- [x] Mention registration linked to passages.
-- [x] Relationship registration with evidence passages.
-- [x] JSON export (combined).
-- [x] Basic TEI-compatible XML export.
-- [x] CSV export of passages and text statistics.
+## Advanced Research Edition (v0.2) — COMPLETED
+- [x] **Large Document Performance:** SQLite FTS5 search indexing and paginated UI rendering.
+- [x] **Bengali Tokenization:** Lightweight rule-based morphological analysis (lemma grouping).
+- [x] **Character-Level Annotation:** Exact Unicode offset mapping with inline HTML highlighting in the reader.
+- [x] **Gephi Integration:** GEXF, Nodes CSV, and Edges CSV export for network analysis.
+- [x] **QGIS Integration:** Spatial metadata fields (Lat/Lon) and GeoJSON export for GIS analysis.
+- [x] **Comparative Analysis:** Multi-document statistics and entity frequency dashboard.
 
-## Known Limitations (to address in 2.0)
-- **Tokenization:** Bengali word counts use whitespace splitting. Morphological variants (e.g., নদী and নদীর) are counted separately. Future versions will integrate a lightweight morphological lemmatizer.
-- **TEI Validation:** The XML export is TEI-compatible but not strictly schema-validated against a custom ODD.
-- **Mentions:** Mentions are currently passage-level, not character-level (no inline highlighting in the UI).
-
-## TextEncode 2.0 — Research Platform
-
-- Automatic entity recognition (NER) using Indic NLP models.
-- Custom entity categories UI.
-- Full TEI P5 validation against `tei_all.rng`.
-- Document versioning and annotation reconciliation.
-- Relationship-network visualisation (NetworkX).
-- Text comparison across documents.
-- GIS / geocoding for place entities.
+## TextEncode 3.0 — Future Vision
+- [ ] Full NLP morphological analysis using transformer models (e.g., BanglaBERT).
+- [ ] Full TEI P5 validation against custom ODD schemas.
+- [ ] Native map visualizations and network graphs embedded directly in the Streamlit UI.
+- [ ] Multi-user support with cloud database synchronization.
+- [ ] Advanced OCR pipeline for PDF ingestion.
