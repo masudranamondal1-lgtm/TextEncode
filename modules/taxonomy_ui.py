@@ -1,5 +1,6 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
+import json
 from database import db
 
 def render_taxonomy_manager():
@@ -10,14 +11,16 @@ def render_taxonomy_manager():
         profiles = db.get_profiles(conn)
     
     if not profiles:
-        st.error("No taxonomy profiles found. Please delete your database file and restart to reset.")
+        st.error("No taxonomy profiles found. Please restart the app to reset.")
         return
         
     profile_options = {p["name"]: p["profile_id"] for p in profiles}
     selected_profile_name = st.selectbox("Active Taxonomy Profile", list(profile_options.keys()))
     profile_id = profile_options[selected_profile_name]
 
-    tab_cat, tab_rel, tab_meta = st.tabs(["📁 Entity Categories", "🔗 Relationship Types", "⚙️ Custom Metadata"])
+    tab_cat, tab_rel, tab_meta, tab_io = st.tabs([
+        "📁 Entity Categories", "🔗 Relationship Types", "⚙️ Custom Metadata", "📦 Import / Export"
+    ])
 
     # --- TAB 1: ENTITY CATEGORIES ---
     with tab_cat:
@@ -45,7 +48,7 @@ def render_taxonomy_manager():
         st.subheader("Current Categories")
         if cats:
             df = pd.DataFrame([dict(c) for c in cats])
-            st.dataframe(df[["category_id", "parent_id", "name", "description", "color"]], hide_index=True)
+            st.dataframe(df[["category_id", "parent_id", "name", "description"]], hide_index=True)
 
     # --- TAB 2: RELATIONSHIP TYPES ---
     with tab_rel:
@@ -95,3 +98,35 @@ def render_taxonomy_manager():
         if attrs:
             df = pd.DataFrame([dict(a) for a in attrs])
             st.dataframe(df[["attribute_id", "target_table", "name", "data_type"]], hide_index=True)
+
+    # --- TAB 4: IMPORT / EXPORT ---
+    with tab_io:
+        st.subheader("Export Profile")
+        st.write("Download this taxonomy as a JSON file to share with other researchers or back it up.")
+        with db.get_connection() as conn:
+            profile_data = db.export_profile(conn, profile_id)
+            json_str = json.dumps(profile_data, ensure_ascii=False, indent=2)
+            
+        st.download_button(
+            label="📥 Download Taxonomy JSON",
+            data=json_str.encode("utf-8"),
+            file_name=f"textencode_taxonomy_{profile_id}.json",
+            mime="application/json"
+        )
+        
+        st.divider()
+        
+        st.subheader("Import Profile")
+        st.write("Upload a previously exported JSON taxonomy. This will create a **new profile** so you don't overwrite your current work.")
+        
+        uploaded_file = st.file_uploader("Upload JSON", type=["json"])
+        if uploaded_file is not None:
+            try:
+                data = json.load(uploaded_file)
+                if st.button("Confirm Import", type="primary"):
+                    with db.get_connection() as conn:
+                        new_id = db.import_profile(conn, data)
+                    st.success(f"Successfully imported taxonomy as a new profile (ID: {new_id}). Please select it from the dropdown above.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Invalid JSON file: {e}")
