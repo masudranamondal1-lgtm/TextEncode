@@ -1,4 +1,4 @@
-﻿"""TextEncode v0.5 — Projects, Corpora, and Evidence."""
+﻿"""TextEncode v0.5 — Complete Research Workstation."""
 
 from __future__ import annotations
 import math
@@ -39,20 +39,18 @@ def _passage_rows_to_dicts(rows) -> list[dict]:
     return [dict(row) for row in rows]
 
 def highlight_mentions(text: str, mentions: list[dict]) -> str:
-    safe_text = html.escape(text)
-    if not mentions: return safe_text
-    sorted_mentions = sorted(mentions, key=lambda m: m["char_start"], reverse=True)
-    highlighted = safe_text
+    if not mentions: return html.escape(text)
+    sorted_mentions = sorted(mentions, key=lambda m: m["char_start"])
+    result = []
+    last_idx = 0
     for m in sorted_mentions:
         start, end = m["char_start"], m["char_end"]
-        if start is not None and end is not None and 0 <= start < end <= len(text):
-            original_slice = text[start:end]
-            safe_slice = html.escape(original_slice)
-            idx = highlighted.find(safe_slice)
-            if idx != -1:
-                tag = f"<mark title='{html.escape(m['entity_id'])}'>{safe_slice}</mark>"
-                highlighted = highlighted[:idx] + tag + highlighted[idx+len(safe_slice):]
-    return highlighted
+        if start >= last_idx and 0 <= start < end <= len(text):
+            result.append(html.escape(text[last_idx:start]))
+            result.append(f"<mark title='{html.escape(m['entity_id'])}'>{html.escape(text[start:end])}</mark>")
+            last_idx = end
+    result.append(html.escape(text[last_idx:]))
+    return "".join(result)
 
 @st.cache_data
 def _cached_stats(text: str) -> dict: return text_analysis.get_basic_stats(text)
@@ -81,14 +79,9 @@ def page_projects() -> None:
     components.page_header("Research Projects", "Organise your corpora.")
     with db.get_connection() as conn:
         projects = db.get_projects(conn)
-        
     tab_view, tab_add = st.tabs(["📋 View Projects", "➕ Add Project"])
-    
     with tab_view:
-        if not projects:
-            components.empty_state("No projects yet.")
-            return
-            
+        if not projects: components.empty_state("No projects yet.")
         for p in projects:
             with st.expander(f"📁 {p['name']}"):
                 st.write(f"**Description:** {p['description'] or 'None'}")
@@ -96,11 +89,8 @@ def page_projects() -> None:
                     corpora = db.get_corpora(conn, p['project_id'])
                 st.markdown("**Corpora:**")
                 if corpora:
-                    for c in corpora:
-                        st.write(f"- {c['name']} ({c['description'] or 'No description'})")
-                else:
-                    st.info("No corpora in this project yet.")
-                    
+                    for c in corpora: st.write(f"- {c['name']} ({c['description'] or 'No description'})")
+                else: st.info("No corpora in this project yet.")
     with tab_add:
         name = st.text_input("Project Name *")
         desc = st.text_area("Description")
@@ -110,45 +100,26 @@ def page_projects() -> None:
                     pid = db.create_project(conn, name.strip(), desc.strip())
                     db.create_corpus(conn, pid, "Default Corpus", "Initial corpus.")
                 st.success("Project created."); st.rerun()
-            else:
-                st.error("Name required.")
+            else: st.error("Name required.")
 
 def page_documents() -> None:
     components.page_header("Document Library", "Manage imported Markdown texts.")
-    
-    with db.get_connection() as conn:
-        projects = db.get_projects(conn)
-        
-    if not projects:
-        components.empty_state("No projects available. Create one first.")
-        return
-        
+    with db.get_connection() as conn: projects = db.get_projects(conn)
+    if not projects: components.empty_state("No projects available. Create one first."); return
     project_options = {p["name"]: p["project_id"] for p in projects}
-    selected_proj_name = st.selectbox("Active Project", list(project_options.keys()))
-    project_id = project_options[selected_proj_name]
-    
-    with db.get_connection() as conn:
-        corpora = db.get_corpora(conn, project_id)
-        
+    project_id = project_options[st.selectbox("Active Project", list(project_options.keys()))]
+    with db.get_connection() as conn: corpora = db.get_corpora(conn, project_id)
     if not corpora:
-        st.warning("No corpora in this project. Add one below.")
-        with st.form("add_corpus"):
-            c_name = st.text_input("Corpus Name")
-            if st.form_submit_button("Create Corpus"):
-                with db.get_connection() as conn: db.create_corpus(conn, project_id, c_name, "")
-                st.rerun()
+        st.warning("No corpora in this project.")
         return
-        
     corpus_options = {c["name"]: c["corpus_id"] for c in corpora}
-    selected_corpus_name = st.selectbox("Active Corpus", list(corpus_options.keys()))
-    corpus_id = corpus_options[selected_corpus_name]
+    corpus_id = corpus_options[st.selectbox("Active Corpus", list(corpus_options.keys()))]
     
     tab_import, tab_manage = st.tabs(["Import Documents", "Manage Documents"])
-    
     with tab_import:
         uploaded = st.file_uploader("Upload Markdown files", type=["md", "markdown", "txt"], accept_multiple_files=True)
         if not uploaded: return
-        batch_language = st.text_input("Language for this batch (optional)", placeholder="e.g. Bengali")
+        batch_language = st.text_input("Language for this batch (optional)")
         parsed = []
         for f in uploaded:
             try:
@@ -174,15 +145,12 @@ def page_documents() -> None:
                         doc_id = db.save_document(conn, title=metadata[idx]["title"], original_filename=item["file"].name, source_text=item["text"], passages=item["passages"], language=metadata[idx]["language"], corpus_id=corpus_id)
                         st.success(f"Saved {item['file'].name} as {doc_id}.")
                     except Exception as e: st.error(f"Failed to save {item['file'].name}: {e}")
-                        
     with tab_manage:
         with db.get_connection() as conn: docs = db.list_documents(conn, corpus_id)
         if not docs:
             components.empty_state("This corpus is empty.")
             return
-            
         st.write("Expand a document below to edit its metadata or move it to the trash.")
-        
         for d in docs:
             with st.expander(f"📄 {d['doc_id']} — {d['title']}"):
                 with st.form(f"edit_doc_form_{d['doc_id']}"):
@@ -190,14 +158,10 @@ def page_documents() -> None:
                     new_author = st.text_input("Author", value=d["author"] or "", key=f"author_{d['doc_id']}")
                     new_lang = st.text_input("Language", value=d["language"] or "", key=f"lang_{d['doc_id']}")
                     new_pub = st.text_input("Publication Info", value=d["publication_info"] or "", key=f"pub_{d['doc_id']}")
-                    
                     col1, col2 = st.columns(2)
                     if col1.form_submit_button("Save Changes", type="primary"):
-                        with db.get_connection() as conn:
-                            db.update_document_metadata(conn, d['doc_id'], new_title, new_author, new_lang, new_pub)
-                        st.success("Document updated.")
-                        st.rerun()
-                        
+                        with db.get_connection() as conn: db.update_document_metadata(conn, d['doc_id'], new_title, new_author, new_lang, new_pub)
+                        st.success("Document updated."); st.rerun()
                     if col2.form_submit_button("🗑️ Move to Trash", type="secondary"):
                         with db.get_connection() as conn: db.soft_delete_document(conn, d['doc_id'])
                         st.rerun()
@@ -231,6 +195,60 @@ def page_reader() -> None:
             p_mentions = mentions_by_passage.get(p["passage_id"], [])
             highlighted_text = highlight_mentions(p["plain_text"], p_mentions) if show_annotations else html.escape(p["plain_text"])
             st.markdown(f"<div class='reader-container'>{highlighted_text}</div><br>", unsafe_allow_html=True)
+
+def page_manual_annotation() -> None:
+    components.page_header("Manual Annotation", "Select a passage and link it to an entity.")
+    
+    with db.get_connection() as conn:
+        documents = db.list_documents(conn)
+        profiles = db.get_profiles(conn)
+        profile_id = profiles[0]["profile_id"] if profiles else 1
+        existing_entities = db.get_entities(conn, profile_id)
+        
+    if not documents or not existing_entities:
+        components.empty_state("You need both documents and entities to create mentions.")
+        return
+        
+    doc_options = {f"{d['doc_id']} — {d['title']}": d["doc_id"] for d in documents}
+    doc_id = doc_options[st.selectbox("1. Select Document", list(doc_options.keys()))]
+    
+    with db.get_connection() as conn:
+        passages = db.get_passages(conn, doc_id)
+        
+    if not passages:
+        components.empty_state("No passages found in this document.")
+        return
+        
+    passage_options = {f"{p['passage_id']}: {p['plain_text'][:60]}...": p["passage_id"] for p in passages}
+    passage_id = passage_options[st.selectbox("2. Select Passage", list(passage_options.keys()))]
+    selected_passage = next(p for p in passages if p["passage_id"] == passage_id)
+    
+    st.info(f"**Passage Text:**\n\n{selected_passage['plain_text']}")
+    
+    with st.form("manual_annotation_form"):
+        col1, col2 = st.columns(2)
+        surface_form = col1.text_input("3. Exact Text to Annotate *", placeholder="Copy exact text from above")
+        
+        entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in existing_entities}
+        selected_entity = col2.selectbox("4. Link to Entity *", list(entity_options.keys()))
+        
+        if st.form_submit_button("Save Annotation", type="primary"):
+            if not surface_form.strip():
+                st.error("Text is required.")
+            else:
+                text = selected_passage["plain_text"]
+                start_idx = text.find(surface_form.strip())
+                if start_idx == -1:
+                    st.error(f"Could not find the exact text '{surface_form}' in this passage.")
+                else:
+                    end_idx = start_idx + len(surface_form.strip())
+                    with db.get_connection() as conn:
+                        try:
+                            db.save_mention(conn, entity_id=entity_options[selected_entity], doc_id=doc_id, passage_id=passage_id, surface_form=surface_form.strip(), char_start=start_idx, char_end=end_idx)
+                            st.success("Annotation saved successfully.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
 def page_text_analysis() -> None:
     components.page_header("Text Analysis", "Voyant-style exploration of your corpus.")
@@ -269,9 +287,7 @@ def page_entities() -> None:
         categories = db.get_categories(conn, profile_id)
         entities = db.get_all_entities_with_stats(conn, profile_id)
     cat_options = {c["name"]: c["category_id"] for c in categories}
-    
     tab_view, tab_add, tab_edit = st.tabs(["📋 View Entities", "➕ Add Seed Entity", "✏️ Edit / Delete"])
-    
     with tab_view:
         if not entities: components.empty_state("No entities registered yet."); return
         df = pd.DataFrame([dict(e) for e in entities])
@@ -281,7 +297,6 @@ def page_entities() -> None:
         if search: df = df[df["canonical_name"].str.contains(search, case=False) | df["alt_names"].fillna("").str.contains(search, case=False)]
         if filter_cat != "All": df = df[df["category_name"] == filter_cat]
         st.dataframe(df[["entity_id", "canonical_name", "alt_names", "category_name", "mention_count"]], hide_index=True, width="stretch")
-
     with tab_add:
         canonical_name = st.text_input("Canonical Name *")
         category_name = st.selectbox("Category *", list(cat_options.keys()))
@@ -294,20 +309,17 @@ def page_entities() -> None:
                     new_id = db.next_entity_id(conn)
                     conn.execute("INSERT INTO entities (entity_id, profile_id, canonical_name, category_id, alt_names, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (new_id, profile_id, canonical_name.strip(), cat_options[category_name], alt_names.strip() or None, description.strip() or None, db.utc_now()))
                 st.success(f"Entity '{canonical_name}' saved as {new_id}."); st.rerun()
-
     with tab_edit:
         if not entities: st.info("No entities to edit."); return
         entity_labels = {f"{e['entity_id']} — {e['canonical_name']}": e for e in entities}
         selected_label = st.selectbox("Select entity to manage", list(entity_labels.keys()))
         selected_entity = entity_labels[selected_label]
-        
         with st.form("edit_entity_form"):
             e_name = st.text_input("Canonical Name", value=selected_entity["canonical_name"])
             current_cat_idx = list(cat_options.keys()).index(selected_entity["category_name"])
             e_cat = st.selectbox("Category", list(cat_options.keys()), index=current_cat_idx)
             e_alt = st.text_input("Alternative Names", value=selected_entity["alt_names"] or "")
             e_desc = st.text_area("Description", value=selected_entity["description"] or "")
-            
             col1, col2 = st.columns(2)
             if col1.form_submit_button("Update Entity", type="primary"):
                 with db.get_connection() as conn: db.update_entity_details(conn, selected_entity["entity_id"], e_name.strip(), cat_options[e_cat], e_alt.strip() or None, e_desc.strip() or None)
@@ -315,7 +327,6 @@ def page_entities() -> None:
             if col2.form_submit_button("🗑️ Move to Trash", type="secondary"):
                 with db.get_connection() as conn: db.soft_delete_entity(conn, selected_entity["entity_id"])
                 st.warning(f"Moved {selected_entity['entity_id']} to trash."); st.rerun()
-                
         st.divider()
         st.subheader("Manage Mentions")
         with db.get_connection() as conn: mentions = db.get_mentions_for_entity(conn, selected_entity["entity_id"])
@@ -326,8 +337,7 @@ def page_entities() -> None:
                 if st.button("Delete Mention", key=f"del_{m['mention_id']}", type="secondary"):
                     with db.get_connection() as conn: db.delete_mention(conn, m['mention_id'])
                     st.rerun()
-        else:
-            st.info("No mentions found for this entity.")
+        else: st.info("No mentions found for this entity.")
 
 def page_relationships() -> None:
     components.page_header("Relationship Management", "Connect entities with evidence.")
@@ -337,16 +347,11 @@ def page_relationships() -> None:
         entities = db.get_entities(conn, profile_id)
         rel_types = db.get_relationship_types(conn, profile_id)
         rels = db.get_relationships(conn)
-        
     if len(entities) < 2:
-        components.empty_state("You need at least two entities to create a relationship.")
-        return
-        
+        components.empty_state("You need at least two entities to create a relationship."); return
     entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in entities}
     type_options = {rt["name"]: rt["type_id"] for rt in rel_types}
-    
     tab_view, tab_add = st.tabs(["📋 View Relationships", "➕ Add Relationship"])
-    
     with tab_view:
         if not rels: st.info("No relationships yet.")
         else:
@@ -354,40 +359,29 @@ def page_relationships() -> None:
                 with st.container(border=True):
                     st.markdown(f"**{r['source_name']}** `[{r['type_name']}]` **{r['target_name']}**")
                     if r['description']: st.caption(r['description'])
-                    
                     with st.expander("Edit Relationship & Manage Evidence"):
                         with st.form(f"edit_rel_{r['relationship_id']}"):
                             src_opts = list(entity_options.keys())
                             tgt_opts = list(entity_options.keys())
                             type_list = list(type_options.keys())
-                            
                             current_src = next((k for k, v in entity_options.items() if v == r['source_entity_id']), "[Deleted Entity]")
                             current_tgt = next((k for k, v in entity_options.items() if v == r['target_entity_id']), "[Deleted Entity]")
-                            
                             src_idx = src_opts.index(current_src) if current_src in src_opts else 0
                             tgt_idx = tgt_opts.index(current_tgt) if current_tgt in tgt_opts else 0
                             type_idx = type_list.index(r['type_name']) if r['type_name'] in type_list else 0
-                            
                             new_src = st.selectbox("Source Entity", src_opts, index=src_idx)
                             new_tgt = st.selectbox("Target Entity", tgt_opts, index=tgt_idx)
                             new_type = st.selectbox("Type", type_list, index=type_idx)
                             new_desc = st.text_area("Description", value=r['description'] or "")
-                            
                             col1, col2 = st.columns(2)
                             if col1.form_submit_button("Save Changes", type="primary"):
-                                with db.get_connection() as conn:
-                                    db.update_relationship(conn, r['relationship_id'], entity_options[new_src], entity_options[new_tgt], type_options[new_type], new_desc)
-                                st.success("Updated.")
-                                st.rerun()
+                                with db.get_connection() as conn: db.update_relationship(conn, r['relationship_id'], entity_options[new_src], entity_options[new_tgt], type_options[new_type], new_desc)
+                                st.success("Updated."); st.rerun()
                             if col2.form_submit_button("🗑️ Delete", type="secondary"):
                                 with db.get_connection() as conn: db.delete_relationship(conn, r['relationship_id'])
                                 st.rerun()
-                                
-                        # Evidence Bundle Management
                         st.markdown("**Evidence Bundles**")
-                        with db.get_connection() as conn:
-                            evidence = db.get_evidence_for_relationship(conn, r['relationship_id'])
-                        
+                        with db.get_connection() as conn: evidence = db.get_evidence_for_relationship(conn, r['relationship_id'])
                         if evidence:
                             for e in evidence:
                                 col_a, col_b = st.columns([4, 1])
@@ -396,21 +390,16 @@ def page_relationships() -> None:
                                 if col_b.button("Delete", key=f"del_ev_{e['evidence_id']}", type="secondary"):
                                     with db.get_connection() as conn: db.delete_evidence_bundle(conn, e['evidence_id'])
                                     st.rerun()
-                        else:
-                            st.info("No evidence attached yet.")
-                            
+                        else: st.info("No evidence attached yet.")
                         with st.form(f"add_ev_{r['relationship_id']}"):
                             domain = st.selectbox("Evidence Domain", ["Literary", "Historical", "Geographical"])
                             ev_text = st.text_area("Source Text / Evidence *")
                             ev_context = st.text_input("Context / Reference")
                             if st.form_submit_button("Add Evidence Bundle"):
                                 if ev_text.strip():
-                                    with db.get_connection() as conn:
-                                        db.add_evidence_bundle(conn, r['relationship_id'], domain, ev_text.strip(), ev_context.strip())
+                                    with db.get_connection() as conn: db.add_evidence_bundle(conn, r['relationship_id'], domain, ev_text.strip(), ev_context.strip())
                                     st.success("Evidence added."); st.rerun()
-                                else:
-                                    st.error("Evidence text required.")
-
+                                else: st.error("Evidence text required.")
     with tab_add:
         with st.form("add_relationship"):
             source = st.selectbox("Source Entity", list(entity_options.keys()))
@@ -429,11 +418,7 @@ def page_trash() -> None:
         docs = db.list_documents(conn, include_deleted=True)
         deleted_docs = [d for d in docs if d["deleted_at"] is not None]
         entities = conn.execute("SELECT * FROM entities WHERE deleted_at IS NOT NULL").fetchall()
-        
-    if not deleted_docs and not entities:
-        components.empty_state("Trash is empty.")
-        return
-        
+    if not deleted_docs and not entities: components.empty_state("Trash is empty."); return
     if deleted_docs:
         st.subheader("Deleted Documents")
         for d in deleted_docs:
@@ -448,7 +433,6 @@ def page_trash() -> None:
                 if col3.button("❌ Delete Forever", key=f"delete_{d['doc_id']}", disabled=not confirm, type="secondary", width="stretch"):
                     with db.get_connection() as conn: db.permanent_delete_document(conn, d['doc_id'])
                     st.rerun()
-                    
     if entities:
         st.subheader("Deleted Entities")
         for e in entities:
@@ -574,9 +558,10 @@ pg = st.navigation({
         st.Page(spatial_page.render_spatial_analysis, title="Spatial Analysis", icon=":material/map:"),
     ],
     "Annotation": [
+        st.Page(page_manual_annotation, title="Manual Annotation", icon=":material/edit_note:"),
+        st.Page(page_ai_review, title="AI Candidate Review", icon=":material/psychology:"),
         st.Page(page_entities, title="Entity Catalogue", icon=":material/category:"),
         st.Page(page_relationships, title="Relationships", icon=":material/link:"),
-        st.Page(page_ai_review, title="AI Candidate Review", icon=":material/psychology:"),
     ],
     "Configuration": [
         st.Page(taxonomy_ui.render_taxonomy_manager, title="Taxonomy Manager", icon=":material/account_tree:"),
