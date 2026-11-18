@@ -1,0 +1,52 @@
+"""Focused regression tests for TextEncode linguistic and analysis modules."""
+import unittest
+
+from modules.linguistics import tokenize, tokenize_with_offsets, filter_stopwords
+from modules.text_analysis import get_basic_stats, get_ngrams, get_kwic
+from modules.processor import document_statistics, search_passages
+
+
+class LinguisticsTests(unittest.TestCase):
+    def test_bengali_vowel_marks_remain_attached(self):
+        self.assertEqual(tokenize('ইছামতী নদী'), ['ইছামতী', 'নদী'])
+
+    def test_punctuation_is_not_a_word(self):
+        self.assertEqual(tokenize('বাংলা, English!!!'), ['বাংলা', 'english'])
+
+    def test_offsets_point_to_exact_surface(self):
+        text = 'ইছামতী নদী। English ১২৩'
+        for token in tokenize_with_offsets(text):
+            self.assertEqual(text[token.start:token.end], token.surface)
+
+    def test_stopword_filter_is_explicit(self):
+        self.assertEqual(filter_stopwords(['আর', 'নদী']), ['নদী'])
+
+
+class AnalysisTests(unittest.TestCase):
+    def test_stats(self):
+        stats = get_basic_stats('ইছামতী নদী। ইছামতী গ্রাম।')
+        self.assertEqual(stats['word_count'], 4)
+        self.assertEqual(stats['sentence_count'], 2)
+
+    def test_ngrams(self):
+        self.assertEqual(get_ngrams('নদী গ্রাম নদী', 2)[0], ('নদী গ্রাম', 1))
+
+    def test_kwic_offsets(self):
+        text = 'ইছামতী নদী। ইছামতী গ্রাম।'
+        self.assertEqual(get_kwic(text, 'ইছামতী')[1]['start'], 12)
+        self.assertEqual(get_kwic(text, ''), [])
+
+    def test_passage_search_offsets(self):
+        text = 'ইছামতী নদী। ইছামতী গ্রাম।'
+        passage = {'doc_id': 'D1', 'passage_id': 'P1', 'sequence': 1,
+                   'passage_type': 'paragraph', 'plain_text': text}
+        result = search_passages([passage], 'ইছামতী')[0]
+        self.assertEqual(result['matches'][1]['start'], 12)
+
+    def test_document_statistics(self):
+        stats = document_statistics('নদী গ্রাম', [{'passage_type': 'paragraph', 'plain_text': 'নদী গ্রাম'}])
+        self.assertEqual(stats['word_count'], 2)
+
+
+if __name__ == '__main__':
+    unittest.main()

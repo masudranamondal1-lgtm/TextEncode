@@ -1,0 +1,44 @@
+"""Temporary-database checks for parser -> persistence -> mention offsets."""
+import tempfile
+import unittest
+from pathlib import Path
+from database import db
+from modules import parser
+
+class DatabasePipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / 'pipeline.db'
+        db.init_db(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_import_and_annotate_bengali_passage(self):
+        source = '# ইছামতী\n\nইছামতী নদী শান্ত ছিল।\n'
+        passages = parser.parse_markdown(source)
+        with db.get_connection(self.path) as conn:
+            doc_id = db.save_document(conn, title='ইছামতী', original_filename='test.md', source_text=source, passages=passages)
+            profile = db.get_profiles(conn)[0]
+            categories = db.get_categories(conn, profile['profile_id'])
+            river = next(c for c in categories if c['name'] == 'River or hydrological feature')
+            entity_id = db.next_entity_id(conn)
+            conn.execute("INSERT INTO entities (entity_id, profile_id, canonical_name, category_id, created_at) VALUES (?, ?, ?, ?, ?)", (entity_id, profile['profile_id'], 'ইছামতী', river['category_id'], db.utc_now()))
+            saved_passages = db.get_passages(conn, doc_id)
+            target = next(p for p in saved_passages if p['plain_text'].startswith('ইছামতী নদী'))
+            start = target['plain_text'].index('ইছামতী')
+            mention_id = db.save_mention(conn, entity_id=entity_id, doc_id=doc_id, passage_id=target['passage_id'], surface_form='ইছামতী', char_start=start, char_end=start+len('ইছামতী'))
+            self.assertTrue(mention_id.startswith('MEN-'))
+            self.assertEqual(target['plain_text'][start:start+len('ইছামতী')], 'ইছামতী')
+
+    def test_markdown_source_and_plain_text_are_distinct_offset_spaces(self):
+        source = '# Title\n\n**ইছামতী** নদী।\n'
+        passage = parser.parse_markdown(source)[1]
+        self.assertEqual(passage['plain_text'], 'ইছামতী নদী।')
+        self.assertEqual(source[passage['char_start']:passage['char_end']], passage['text'])
+        # This assertion documents why adding local plain_text offsets to the
+        # passage's source start is not generally a valid source offset.
+        self.assertNotEqual(passage['text'], passage['plain_text'])
+
+if __name__ == '__main__':
+    unittest.main()

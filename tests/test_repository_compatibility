@@ -1,0 +1,48 @@
+"""Compatibility checks against TextEncode's existing public module contracts."""
+import unittest
+from modules import parser, processor, text_analysis
+
+class ParserCompatibilityTests(unittest.TestCase):
+    def test_exact_source_slices_crlf(self):
+        source = "# Title\r\n\r\nBody text.\r\n"
+        passages = parser.parse_markdown(source)
+        self.assertEqual([p["text"] for p in passages], ["# Title", "Body text."])
+        for p in passages:
+            self.assertEqual(source[p["char_start"]:p["char_end"]], p["text"])
+
+    def test_bare_carriage_return_rejected(self):
+        with self.assertRaises(ValueError):
+            parser.parse_markdown("line one\rline two")
+
+    def test_indented_code_block_included(self):
+        passages = parser.parse_markdown("Paragraph\n\n    x = 1\n")
+        self.assertIn("code_block", [p["passage_type"] for p in passages])
+
+    def test_bengali_heading_and_paragraph(self):
+        source = "# অধ্যায় এক\n\nইছামতী নদী শান্ত ছিল।\n"
+        passages = parser.parse_markdown(source)
+        self.assertEqual(passages[0]["plain_text"], "অধ্যায় এক")
+        self.assertEqual(passages[1]["plain_text"], "ইছামতী নদী শান্ত ছিল।")
+
+class LegacyProcessorContractTests(unittest.TestCase):
+    def test_existing_processor_api(self):
+        self.assertEqual(processor.tokenize("ইছামতী নদী শান্ত ছিল।"), ["ইছামতী", "নদী", "শান্ত", "ছিল"])
+        self.assertEqual(processor.count_words("Hello, world! — ok"), 3)
+        self.assertEqual(processor.count_sentences("One. Two! Three?"), 3)
+
+    def test_search_keeps_legacy_result_fields_and_adds_offsets(self):
+        passages = [{"doc_id":"DOC-001", "passage_id":"DOC-001-P001", "sequence":1,
+                     "passage_type":"paragraph", "heading_path":"", "plain_text":"The Ichhamati river."}]
+        result = processor.search_passages(passages, "ichhamati")[0]
+        self.assertEqual(result["match_count"], 1)
+        self.assertEqual(result["matches"][0], {"start":4, "end":13, "text":"Ichhamati"})
+        self.assertIn("snippets", result)
+
+    def test_app_text_analysis_api(self):
+        stats = text_analysis.get_basic_stats("ইছামতী নদী।")
+        self.assertIn("word_count", stats)
+        self.assertIn("unique_words", stats)
+        self.assertEqual(text_analysis.get_kwic("ইছামতী নদী", "নদী")[0]["start"], 7)
+
+if __name__ == "__main__":
+    unittest.main()
