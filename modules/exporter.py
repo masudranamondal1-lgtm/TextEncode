@@ -64,3 +64,30 @@ def generate_tei_xml(conn, doc_id: str) -> str:
         p_el.text = p["plain_text"]
 
     return etree.tostring(tei, pretty_print=True, xml_declaration=True, encoding="UTF-8").decode("utf-8")
+
+def generate_qgis_geojson(conn) -> str:  # noqa: F811  (intentional override)
+    rows = conn.execute(
+        "SELECT entity_id, canonical_name, latitude, longitude, geometry_type, geometry_json "
+        "FROM entities WHERE deleted_at IS NULL AND "
+        "(geometry_json IS NOT NULL OR (latitude IS NOT NULL AND longitude IS NOT NULL))"
+    ).fetchall()
+    features = []
+    for r in rows:
+        geom = None
+        if r["geometry_json"]:
+            try:
+                geom = json.loads(r["geometry_json"])
+            except json.JSONDecodeError:
+                geom = None
+        if geom is None and r["latitude"] is not None and r["longitude"] is not None:
+            geom = {"type": "Point", "coordinates": [r["longitude"], r["latitude"]]}
+        if geom is None:
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {"entity_id": r["entity_id"], "name": r["canonical_name"],
+                           "geometry_type": r["geometry_type"] or geom["type"]},
+        })
+    return json.dumps({"type": "FeatureCollection", "features": features},
+                      ensure_ascii=False, indent=2)
