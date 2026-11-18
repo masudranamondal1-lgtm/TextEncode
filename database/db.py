@@ -786,12 +786,20 @@ def init_external_authorities(conn) -> None:
     """Seed default authorities if the table is empty."""
     count = conn.execute("SELECT COUNT(*) FROM external_authorities").fetchone()[0]
     if count == 0:
-        conn.execute("""
-            INSERT INTO external_authorities (provider_name, namespace, base_uri, enabled, attribution)
-            VALUES 
-            ('Wikidata', 'wikidata', 'http://www.wikidata.org/entity/', 1, 'Wikidata is a free and open knowledge base.'),
-            ('GeoNames', 'geonames', 'http://sws.geonames.org/', 1, 'GeoNames is a geographical database.')
-        """)
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO external_authorities
+                (provider_name, namespace, base_uri, enabled, attribution, created_at)
+            VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Wikidata", "wikidata", "http://www.wikidata.org/entity/", 1,
+                "Wikidata is a free and open knowledge base.", now,
+                "GeoNames", "geonames", "http://sws.geonames.org/", 1,
+                "GeoNames is a geographical database.", now,
+            ),
+        )
 
 def get_enabled_authorities(conn) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM external_authorities WHERE enabled = 1").fetchall()
@@ -857,4 +865,7 @@ def update_reconciliation_candidate_status(conn, candidate_id: int, status: str)
     allowed = {"accepted", "rejected", "deferred", "superseded"}
     if status not in allowed:
         raise ValueError(f"Invalid status: {status}")
-    conn.execute("UPDATE reconciliation_candidates SET review_status = ? WHERE candidate_id = ?", (status, candidate_id))
+    conn.execute(
+        "UPDATE reconciliation_candidates SET review_status = ? WHERE candidate_id = ?",
+        (status, candidate_id),
+    )

@@ -207,9 +207,12 @@ def page_dashboard() -> None:
         st.download_button("Download Database Backup", data=backup_path.read_bytes(), file_name=backup_path.name, mime="application/x-sqlite3", key="download_latest_database_backup")
 
 def page_projects() -> None:
-    components.page_header("Research Projects", "Create, edit, duplicate, move documents between, and recover projects and corpora.")
+    components.page_header(
+        "Research Projects",
+        "Create, edit, duplicate, move documents between, and recover projects and corpora.",
+    )
     with db.get_connection() as conn:
-        projects = db.list_projects(conn)
+        projects = db.get_projects(conn)
     view_tab, create_tab = st.tabs(["Projects", "Create Project"])
     with create_tab:
         with st.form("create_project_form"):
@@ -253,21 +256,25 @@ def page_projects() -> None:
                     safe_rerun()
                 if perm:
                     if not st.session_state.get(f"confirm_perm_proj_{pid}"):
-                        st.session_state[f"confirm_perm_proj_{pid}"] = st.checkbox("I understand: this deletes all corpora and documents in this project", key=f"chk_perm_proj_{pid}")
+                        st.session_state[f"confirm_perm_proj_{pid}"] = st.checkbox(
+                            "I understand: this deletes all corpora and documents in this project",
+                            key=f"chk_perm_proj_{pid}",
+                        )
                         st.stop()
                     with db.get_connection() as conn:
                         db.hard_delete_project(conn, pid)
                     safe_rerun()
 
+                # Load corpora, docs and move-targets in ONE open connection.
                 with db.get_connection() as conn:
                     corpora = db.get_corpora(conn, pid)
                     docs = db.list_documents(conn)
-                    move_map = {}
+                    move_map: dict[str, int] = {}
                     for p in projects:
                         for c in db.get_corpora(conn, p["project_id"]):
                             move_map[f"{p['name']} / {c['name']} (#{c['corpus_id']})"] = c["corpus_id"]
-                    move_labels = list(move_map)
-                
+                move_labels = list(move_map)
+
                 st.markdown("**Corpora & documents**")
                 for corpus in corpora:
                     cid = corpus["corpus_id"]
@@ -290,13 +297,18 @@ def page_projects() -> None:
                         corpus_docs = [d for d in docs if d["corpus_id"] == cid]
                         if corpus_docs:
                             for d in corpus_docs:
-                                mv = st.selectbox(f"Move {d['doc_id']} to:", move_labels, key=f"mv_{d['doc_id']}")
+                                mv = st.selectbox(
+                                    f"Move {d['doc_id']} to:",
+                                    move_labels,
+                                    key=f"mv_{d['doc_id']}",
+                                )
                                 if st.button("Move here", key=f"mvbtn_{d['doc_id']}"):
                                     with db.get_connection() as conn:
                                         db.move_document_to_corpus(conn, d["doc_id"], move_map[mv])
                                     safe_rerun()
                         else:
                             st.caption("No active documents in this corpus.")
+
 
 def page_documents() -> None:
     components.page_header("Document Library", "Import, inspect, edit and organise research documents.")
@@ -1034,7 +1046,7 @@ def page_ai_review() -> None:
                     st.info("Candidate remains pending.")
                 elif decision == "Reject":
                     with db.get_connection() as conn:
-                        db.update_candidate_status(conn, candidate["candidate_id"], "rejected")
+                        (conn, candidate["candidate_id"], "rejected")db.update_candidate_status
                     safe_rerun()
                 elif decision == "Link to existing entity" and not linked_entity:
                     st.error("Select an existing entity or choose Create new entity.")
@@ -1049,7 +1061,9 @@ def page_ai_review() -> None:
                                 entity_id = db.next_entity_id(conn)
                                 conn.execute("INSERT INTO entities (entity_id, profile_id, canonical_name, category_id, created_at) VALUES (?, ?, ?, ?, ?)", (entity_id, profile_id, new_name.strip(), categories_by_name[category], db.utc_now()))
                             db.save_mention(conn, entity_id=entity_id, doc_id=doc_id, passage_id=candidate["passage_id"], surface_form=selected_phrase, char_start=phrase_start, char_end=phrase_end)
-                            db.update_candidate_status(conn, candidate["candidate_id"], "accepted")
+                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'accepted')
+                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'rejected')
+                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'deferred')
                         st.success("Selected phrase has been annotated.")
                         safe_rerun()
                     except Exception as exc:
