@@ -76,6 +76,36 @@ def highlight_mentions(text: str, mentions: list[dict]) -> str:
         cursor = end
     output.append(html.escape(text[cursor:]))
     return "".join(output)
+def scoped_entity_rows(conn, profile_id: int, doc_id: str | None = None) -> list[Any]:
+    """List entities with mention counts, optionally within one document.
+
+    Canonical entities remain reusable. A document-specific mention links
+    an entity to a passage in that document.
+    """
+    if doc_id:
+        return conn.execute(
+            """
+            SELECT
+                e.entity_id,
+                e.canonical_name,
+                e.alt_names,
+                e.description,
+                c.name AS category_name,
+                COUNT(m.mention_id) AS mention_count
+            FROM entities e
+            JOIN entity_categories c ON c.category_id = e.category_id
+            LEFT JOIN mentions m
+                ON m.entity_id = e.entity_id
+                AND m.doc_id = ?
+                AND m.deleted_at IS NULL
+            WHERE e.profile_id = ?
+              AND e.deleted_at IS NULL
+            GROUP BY e.entity_id
+            ORDER BY mention_count DESC, e.canonical_name COLLATE NOCASE
+            """,
+            (doc_id, profile_id),
+        ).fetchall()
+    return db.get_all_entities_with_stats(conn, profile_id)
 
 def find_all_occurrences(text: str, needle: str) -> list[tuple[int, int]]:
     if not needle:
@@ -576,7 +606,10 @@ def page_text_analysis() -> None:
                 st.info("No matching contexts found.")
 
 def page_entities() -> None:
-    components.page_header("Entity Catalogue", "Manage canonical entities, inspect mentions, and reconcile with external authorities.")
+    components.page_header(
+        "Entity Catalogue",
+        "Manage canonical entities, inspect document-specific mentions, and reconcile with external authorities.",
+    )
     with db.get_connection() as conn:
         profiles = db.get_profiles(conn)
         documents = db.list_documents(conn)
@@ -591,16 +624,180 @@ def page_entities() -> None:
         render_empty("The selected taxonomy profile has no categories.")
         return
     category_options = {category["name"]: category["category_id"] for category in categories}
-    
-    # Added 'external_tab' to the tabs list
+
+    # 5 Tabs including the new External Identity tab
     view_tab, add_tab, edit_tab, document_tab, external_tab = st.tabs(
         ["Catalogue", "Add Seed Entity", "Edit Entity", "By Document", "External Identity"]
     )
-    
-    # --- [Keep your existing view_tab, add_tab, edit_tab, and document_tab code exactly as it was] ---
-    # (For brevity, assume the first 4 tabs remain unchanged from your current file)
-    # ... (Paste your existing code for view_tab, add_tab, edit_tab, document_tab here) ...
 
+    # -------------------------------------------------------------------------
+    # TAB 1: Catalogue
+    # -------------------------------------------------------------------------
+    with view_tab:
+        if not entities:
+            st.info("No entities have been registered.")
+        else:
+            frame = pd.DataFrame(rows_as_dicts(entities))
+            col_search, col_category = st.columns([2, 1])
+            search = col_search.text_input("Search entity name or alias", key="entity_search")
+            category_filter = col_category.selectbox(
+                "Category", ["All"] + list(category_options.keys()), key="entity_category_filter"
+            )
+            if search:
+                pattern = search.strip()
+                frame = frame[
+                    frame["canonical_name"].fillna("").str.contains(pattern, case=False, regex=False)
+                    | frame["alt_names"].fillna("").str.contains(pattern, case=False, regex=False)
+                ]
+            if category_filter != "All":
+                frame = frame[frame["category_name"] == category_filter]
+            
+            # Attempt to add external link columns if the Phase 4 schema is present
+            try:
+                with db.get_connection() as conn:
+                    has_ids = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_identifiers'"
+                    ).fetchone()
+                    if has_ids:
+                        ext_rows = conn.execute(
+                            """SELECT entity_id, COUNT(*) AS ext_count, GROUP_CONCAT(external_identifier) AS ext_ids
+                               FROM entity_identifiers GROUP BY entity_id"""
+                        ).fetchall()
+                        counts = {r["entity_id"]: (r["ext_count"], r["ext_ids"]) for r in ext_rows}
+                        frame["external_links"] = frame["entity_id"].map(lambda eid: counts.get(eid, (0, ""))[0])
+                        frame["external_ids"] = frame["entity_id"].map(lambda eid: counts.get(eid, (0, ""))[1])
+            except Exception:
+                pass  # Fallback silently if schema is not yet updated
+
+            visible_columns = [
+                c for c in [
+                    "entity_id", "canonical_name", "alt_names", "category_name", 
+                    "mention_count", "external_links", "external_ids"
+                ] if c in frame.columns
+            ]
+            st.dataframe(frame[visible_columns], hide_index=True, width="stretch")
+
+    # -------------------------------------------------------------------------
+    # TAB 2: Add Seed Entity
+    # -------------------------------------------------------------------------
+    with add_tab:
+        with st.form("add_seed_entity_form"):
+            canonical_name = st.text_input("Canonical name *")
+            category_name = st.selectbox("Category", list(category_options.keys()))
+            aliases = st.text_input("Alternative names", help="Separate aliases with commas.")
+            description = st.text_area("Description")
+            submitted = st.form_submit_button("Register Entity", type="primary")
+        if submitted:
+            if not canonical_name.strip():
+                st.error("Canonical name is required.")
+            else:
+                try:
+                    with db.get_connection() as conn:
+                        entity_id = db.next_entity_id(conn)
+                        conn.execute(
+                            """INSERT INTO entities
+                            (entity_id, profile_id, canonical_name, category_id, alt_names, description, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                entity_id, profile_id, canonical_name.strip(),
+                                category_options[category_name], aliases.strip() or None,
+                                description.strip() or None, db.utc_now(),
+                            ),
+                        )
+                    st.success(f"Registered {canonical_name.strip()} as {entity_id}.")
+                    safe_rerun()
+                except Exception as exc:
+                    st.error(f"Could not register entity: {exc}")
+
+    # -------------------------------------------------------------------------
+    # TAB 3: Edit Entity
+    # -------------------------------------------------------------------------
+    with edit_tab:
+        if not entities:
+            st.info("There are no entities to edit.")
+        else:
+            entity_map = {f"{e['entity_id']} — {e['canonical_name']}": dict(e) for e in entities}
+            selected = st.selectbox("Select entity", list(entity_map.keys()), key="edit_entity_selection")
+            entity = entity_map[selected]
+            with st.form("edit_entity_details_form"):
+                new_name = st.text_input("Canonical name", value=entity["canonical_name"] or "")
+                category_names = list(category_options.keys())
+                current_category = entity["category_name"]
+                category_index = category_names.index(current_category) if current_category in category_names else 0
+                new_category = st.selectbox("Category", category_names, index=category_index)
+                new_aliases = st.text_input("Alternative names", value=entity["alt_names"] or "")
+                new_description = st.text_area("Description", value=entity["description"] or "")
+                save = st.form_submit_button("Save Entity Changes", type="primary")
+            if save:
+                if not new_name.strip():
+                    st.error("Canonical name cannot be empty.")
+                else:
+                    with db.get_connection() as conn:
+                        db.update_entity_details(
+                            conn, entity["entity_id"], new_name.strip(),
+                            category_options[new_category], new_aliases.strip() or None,
+                            new_description.strip() or None,
+                        )
+                    st.success("Entity updated.")
+                    safe_rerun()
+            
+            st.warning("Moving an entity to Trash hides it from active catalogues. Existing mentions remain stored.")
+            if st.button("Move Entity to Trash", key=f"trash_entity_{entity['entity_id']}"):
+                with db.get_connection() as conn:
+                    db.soft_delete_entity(conn, entity["entity_id"])
+                safe_rerun()
+            
+            st.subheader("Mentions of this entity")
+            with db.get_connection() as conn:
+                mentions = db.get_mentions_for_entity(conn, entity["entity_id"])
+            if mentions:
+                for mention in mentions:
+                    with st.container(border=True):
+                        st.markdown(f"**{mention['mention_id']}** · `{mention['surface_form']}`")
+                        st.caption(f"Passage: {mention['passage_id']}")
+                        st.write(mention["plain_text"])
+                        if st.button("Move mention to Trash", key=f"trash_mention_{mention['mention_id']}"):
+                            with db.get_connection() as conn:
+                                db.delete_mention(conn, mention["mention_id"])
+                            safe_rerun()
+            else:
+                st.info("No active mentions are linked to this entity.")
+
+    # -------------------------------------------------------------------------
+    # TAB 4: By Document
+    # -------------------------------------------------------------------------
+    with document_tab:
+        if not documents:
+            st.info("Import documents to inspect document-specific entities.")
+        else:
+            doc_options = make_document_options(documents)
+            selected_doc = st.selectbox("Document", list(doc_options.keys()), key="entity_document_scope")
+            doc_id = doc_options[selected_doc]
+            with db.get_connection() as conn:
+                document_entities = scoped_entity_rows(conn, profile_id, doc_id)
+                mention_rows = conn.execute(
+                    """SELECT m.mention_id, m.entity_id, e.canonical_name, m.surface_form, m.passage_id,
+                              m.char_start, m.char_end, m.status, m.note
+                       FROM mentions m JOIN entities e ON e.entity_id = m.entity_id
+                       WHERE m.doc_id = ? AND m.deleted_at IS NULL
+                       ORDER BY m.passage_id, m.char_start""",
+                    (doc_id,),
+                ).fetchall()
+            st.subheader("Entities mentioned in this document")
+            present = [dict(row) for row in document_entities if row["mention_count"] > 0]
+            if present:
+                st.dataframe(pd.DataFrame(present), hide_index=True, width="stretch")
+            else:
+                st.info("No entity mentions have been annotated in this document.")
+            st.subheader("Document mention register")
+            if mention_rows:
+                st.dataframe(pd.DataFrame(rows_as_dicts(mention_rows)), hide_index=True, width="stretch")
+            else:
+                st.info("No mentions are registered for this document.")
+
+    # -------------------------------------------------------------------------
+    # TAB 5: External Identity (Phase 4)
+    # -------------------------------------------------------------------------
     with external_tab:
         st.subheader("External Authority Reconciliation")
         st.caption("Connect internal entities to external knowledge bases. Researcher authority is required for all matches.")
@@ -610,14 +807,17 @@ def page_entities() -> None:
             return
             
         entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in entities}
-        selected_entity_label = st.selectbox("Select Entity to Reconcile", list(entity_options.keys()), key="reconcile_entity_select")
+        selected_entity_label = st.selectbox(
+            "Select Entity to Reconcile", list(entity_options.keys()), key="reconcile_entity_select"
+        )
         entity_id = entity_options[selected_entity_label]
         
         with db.get_connection() as conn:
+            # Ensure default authorities are seeded
             db.init_external_authorities(conn)
-            identifiers = db.get_external_identifiers(conn, entity_id)
-            candidates = db.get_candidates_for_entity(conn, entity_id, "suggested")
-            authorities = db.get_enabled_authorities(conn)
+            identifiers = [dict(i) for i in db.get_external_identifiers(conn, entity_id)]
+            candidates = [dict(c) for c in db.get_candidates_for_entity(conn, entity_id, "suggested")]
+            authorities = [dict(a) for a in db.get_enabled_authorities(conn)]
             
         st.markdown("### 1. Accepted Identifiers")
         if identifiers:
@@ -628,45 +828,40 @@ def page_entities() -> None:
                     if st.button("Detach", key=f"detach_{ident['identifier_id']}"):
                         with db.get_connection() as conn:
                             db.remove_entity_identifier(conn, ident["identifier_id"])
-                        st.rerun()
+                        safe_rerun()
         else:
             st.info("No external identifiers linked yet.")
             
         st.divider()
         st.markdown("### 2. Search External Authorities")
         if not authorities:
-            st.warning("No authorities enabled.")
+            st.warning("No authorities enabled in the database.")
         else:
             auth_options = {a["provider_name"]: a["authority_id"] for a in authorities}
             selected_auth_name = st.selectbox("Provider", list(auth_options.keys()), key="reconcile_auth_select")
             auth_id = auth_options[selected_auth_name]
             
-            query = st.text_input("Search Query", key="reconcile_query")
+            query = st.text_input("Search Query (use the entity's real name)", key="reconcile_query")
             lang = st.radio("Language", ["en", "bn"], horizontal=True, key="reconcile_lang")
             
             if st.button("Search", type="primary", key="reconcile_search_btn"):
                 if not query.strip():
                     st.error("Enter a search query.")
+                elif selected_auth_name != "Wikidata":
+                    st.info("Only the Wikidata adapter is currently wired up. Select Wikidata.")
                 else:
                     with st.spinner(f"Searching {selected_auth_name}..."):
                         try:
-                            if selected_auth_name == "Wikidata":
-                                from modules.authorities.wikidata import WikidataProvider
-                                provider = WikidataProvider()
-                                results = provider.search(query, language=lang)
-                            else:
-                                st.warning("GeoNames adapter requires configuration. Using Wikidata for demo.")
-                                from modules.authorities.wikidata import WikidataProvider
-                                provider = WikidataProvider()
-                                results = provider.search(query, language=lang)
-                                
+                            from modules.authorities.wikidata import WikidataProvider
+                            results = WikidataProvider().search(query.strip(), language=lang)
+                            
                             if results:
                                 with db.get_connection() as conn:
-                                    count = db.save_reconciliation_candidates(conn, entity_id, auth_id, results, query)
-                                st.success(f"Found {len(results)} results. {count} new candidates saved.")
-                                st.rerun()
+                                    count = db.save_reconciliation_candidates(conn, entity_id, auth_id, results, query.strip())
+                                st.success(f"Found {len(results)} result(s). {count} new candidates saved.")
+                                safe_rerun()
                             else:
-                                st.info("No results found.")
+                                st.info("No results found. Try an English proper name (e.g., 'Tagore', 'Kolkata').")
                         except ConnectionError as e:
                             st.error(str(e))
                         except Exception as e:
@@ -678,29 +873,32 @@ def page_entities() -> None:
             for c in candidates:
                 with st.container(border=True):
                     st.markdown(f"**{c['external_label']}** ({c['provider_name']})")
-                    st.caption(f"ID: {c['external_identifier']} | URI: {c['external_uri']}")
-                    if c['external_description']:
-                        st.write(c['external_description'])
-                    if c['alternative_names']:
+                    st.markdown(f"🔗 [{c['external_uri']}]({c['external_uri']})")
+                    if c.get("external_description"):
+                        st.caption(c["external_description"])
+                    if c.get("alternative_names"):
                         st.caption(f"Aliases: {c['alternative_names']}")
                     
                     col1, col2, col3 = st.columns(3)
                     if col1.button("✅ Accept", key=f"acc_{c['candidate_id']}"):
                         with db.get_connection() as conn:
-                            db.add_entity_identifier(conn, entity_id, c['authority_id'], c['external_identifier'], c['external_uri'], c['external_label'])
-                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'accepted')
-                        st.rerun()
+                            db.add_entity_identifier(
+                                conn, entity_id, c["authority_id"],
+                                c["external_identifier"], c["external_uri"], c["external_label"]
+                            )
+                            db.update_reconciliation_candidate_status(conn, c["candidate_id"], "accepted")
+                        safe_rerun()
                     if col2.button("❌ Reject", key=f"rej_{c['candidate_id']}"):
                         with db.get_connection() as conn:
-                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'rejected')
-                        st.rerun()
+                            db.update_reconciliation_candidate_status(conn, c["candidate_id"], "rejected")
+                        safe_rerun()
                     if col3.button("⏸️ Defer", key=f"def_{c['candidate_id']}"):
                         with db.get_connection() as conn:
-                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'deferred')
-                        st.rerun()
+                            db.update_reconciliation_candidate_status(conn, c["candidate_id"], "deferred")
+                        safe_rerun()
         else:
             st.info("No pending candidates. Run a search above.")
-            
+
 def _centroid_from_coords(coords):
     pts = [c for c in coords if isinstance(c, (list, tuple)) and len(c) >= 2]
     if not pts:
@@ -968,7 +1166,10 @@ def _candidate_phrase_options(passage_text: str, start: int, end: int) -> dict[s
     return spans
 
 def page_ai_review() -> None:
-    components.page_header("AI Candidate Review", "Choose a suggested word or phrase, then accept, link, reject or defer it.")
+    components.page_header(
+        "AI Candidate Review",
+        "Choose a suggested word or phrase, then accept, link, reject or defer it.",
+    )
     with db.get_connection() as conn:
         documents = db.list_documents(conn)
         profiles = db.get_profiles(conn)
@@ -983,32 +1184,44 @@ def page_ai_review() -> None:
     selected_doc = st.selectbox("Document", list(doc_options), key="ai_review_doc_v2")
     doc_id = doc_options[selected_doc]
     category_map = {c["name"].lower(): c["category_id"] for c in categories}
+    
     if st.button("Run Entity Recognition", type="primary", key="run_ai_recognition_v2"):
         progress = st.progress(0.0, text="Preparing recognition...")
         try:
             with db.get_connection() as conn:
                 passages = db.get_passages(conn, doc_id)
             def progress_update(current, total):
-                progress.progress(current / total if total else 1.0, text=f"Scanning passage {current} of {total}")
-            found = ai_recognizer.recognize_candidates(passages, category_map, entities, progress_callback=progress_update)
+                progress.progress(
+                    current / total if total else 1.0,
+                    text=f"Scanning passage {current} of {total}",
+                )
+            found = ai_recognizer.recognize_candidates(
+                passages, category_map, entities, progress_callback=progress_update
+            )
             with db.get_connection() as conn:
                 count = db.bulk_save_candidates(conn, found)
             progress.empty()
             st.success(f"{count} candidate(s) added to the review queue.")
-            safe_rerun()
+            st.rerun()
         except Exception as exc:
             progress.empty()
             st.error(f"Recognition failed: {exc}")
+            
     with db.get_connection() as conn:
         total = db.count_candidates(conn, doc_id)
-        candidates = rows_as_dicts(db.get_candidates_paginated(conn, doc_id, 100, 0))
+        candidates = db.get_candidates_paginated(conn, doc_id, 100, 0)
         entities = db.get_entities(conn, profile_id)
     st.caption(f"{total} pending candidate(s).")
     if not candidates:
         st.info("No pending candidates in this document.")
         return
+        
     categories_by_name = {c["name"]: c["category_id"] for c in categories}
-    entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in entities}
+    entity_options = {
+        f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"]
+        for e in entities
+    }
+    
     for candidate in candidates:
         with st.container(border=True):
             passage_text = candidate["passage_text"] or ""
@@ -1016,38 +1229,79 @@ def page_ai_review() -> None:
             suggestions = _candidate_phrase_options(passage_text, start, end)
             suggestion_labels = list(suggestions)
             st.markdown(f"**Recognition suggestion:** `{candidate['surface_form']}`")
-            st.caption(f"Method: {candidate['recognition_method'] or 'unspecified'} · Confidence: {candidate['confidence_score']}")
+            st.caption(
+                f"Method: {candidate['recognition_method'] or 'unspecified'} · "
+                f"Confidence: {candidate['confidence_score']}"
+            )
             if candidate.get("contextual_evidence"):
                 st.write(candidate["contextual_evidence"])
-            selected_phrase = st.selectbox("Select a single word or phrase from the suggestions", suggestion_labels, index=(suggestion_labels.index(candidate["surface_form"]) if candidate["surface_form"] in suggestion_labels else 0), key=f"candidate_phrase_{candidate['candidate_id']}")
+                
+            selected_phrase = st.selectbox(
+                "Select a single word or phrase from the suggestions",
+                suggestion_labels,
+                index=(
+                    suggestion_labels.index(candidate["surface_form"])
+                    if candidate["surface_form"] in suggestion_labels else 0
+                ),
+                key=f"candidate_phrase_{candidate['candidate_id']}",
+            )
             phrase_start, phrase_end = suggestions[selected_phrase]
             context_start = max(0, phrase_start - 80)
             context_end = min(len(passage_text), phrase_end + 80)
             st.text(passage_text[context_start:context_end])
+            
             suggested_category = candidate.get("suggested_category_name")
             category_names = list(categories_by_name)
             if not category_names:
                 st.warning("No categories exist in the taxonomy.")
                 continue
-            category_index = category_names.index(suggested_category) if suggested_category in category_names else 0
-            category = st.selectbox("Category", category_names, index=category_index, key=f"candidate_category_v2_{candidate['candidate_id']}")
-            decision = st.radio("Decision", ["Link to existing entity", "Create new entity", "Reject", "Defer"], horizontal=True, key=f"candidate_decision_{candidate['candidate_id']}")
+                
+            category_index = (
+                category_names.index(suggested_category)
+                if suggested_category in category_names else 0
+            )
+            category = st.selectbox(
+                "Category",
+                category_names,
+                index=category_index,
+                key=f"candidate_category_v2_{candidate['candidate_id']}",
+            )
+            decision = st.radio(
+                "Decision",
+                ["Link to existing entity", "Create new entity", "Reject", "Defer"],
+                horizontal=True,
+                key=f"candidate_decision_{candidate['candidate_id']}",
+            )
             linked_entity = None
             new_name = selected_phrase
+            
             if decision == "Link to existing entity":
                 if entity_options:
-                    linked_entity = st.selectbox("Existing entity", list(entity_options), key=f"candidate_link_entity_{candidate['candidate_id']}")
+                    linked_entity = st.selectbox(
+                        "Existing entity",
+                        list(entity_options),
+                        key=f"candidate_link_entity_{candidate['candidate_id']}",
+                    )
                 else:
                     st.info("No existing entity. Choose Create new entity.")
             elif decision == "Create new entity":
-                new_name = st.text_input("Canonical entity name", value=selected_phrase, key=f"candidate_canonical_{candidate['candidate_id']}")
-            if st.button("Apply researcher decision", type="primary", key=f"candidate_apply_v2_{candidate['candidate_id']}"):
+                new_name = st.text_input(
+                    "Canonical entity name",
+                    value=selected_phrase,
+                    key=f"candidate_canonical_{candidate['candidate_id']}",
+                )
+                
+            if st.button(
+                "Apply researcher decision",
+                type="primary",
+                key=f"candidate_apply_v2_{candidate['candidate_id']}",
+            ):
                 if decision == "Defer":
                     st.info("Candidate remains pending.")
                 elif decision == "Reject":
                     with db.get_connection() as conn:
-                        (conn, candidate["candidate_id"], "rejected")db.update_candidate_status
-                    safe_rerun()
+                        db.update_candidate_status(conn, candidate["candidate_id"], "rejected")
+                    st.rerun()
                 elif decision == "Link to existing entity" and not linked_entity:
                     st.error("Select an existing entity or choose Create new entity.")
                 elif decision == "Create new entity" and not new_name.strip():
@@ -1059,13 +1313,29 @@ def page_ai_review() -> None:
                                 entity_id = entity_options[linked_entity]
                             else:
                                 entity_id = db.next_entity_id(conn)
-                                conn.execute("INSERT INTO entities (entity_id, profile_id, canonical_name, category_id, created_at) VALUES (?, ?, ?, ?, ?)", (entity_id, profile_id, new_name.strip(), categories_by_name[category], db.utc_now()))
-                            db.save_mention(conn, entity_id=entity_id, doc_id=doc_id, passage_id=candidate["passage_id"], surface_form=selected_phrase, char_start=phrase_start, char_end=phrase_end)
-                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'accepted')
-                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'rejected')
-                            db.update_reconciliation_candidate_status(conn, c['candidate_id'], 'deferred')
+                                conn.execute(
+                                    """INSERT INTO entities
+                                    (entity_id, profile_id, canonical_name, category_id, created_at)
+                                    VALUES (?, ?, ?, ?, ?)""",
+                                    (
+                                        entity_id, profile_id, new_name.strip(),
+                                        categories_by_name[category], db.utc_now(),
+                                    ),
+                                )
+                            db.save_mention(
+                                conn,
+                                entity_id=entity_id,
+                                doc_id=doc_id,
+                                passage_id=candidate["passage_id"],
+                                surface_form=selected_phrase,
+                                char_start=phrase_start,
+                                char_end=phrase_end,
+                            )
+                            db.update_candidate_status(
+                                conn, candidate["candidate_id"], "accepted"
+                            )
                         st.success("Selected phrase has been annotated.")
-                        safe_rerun()
+                        st.rerun()
                     except Exception as exc:
                         st.error(f"Could not save this annotation: {exc}")
 
