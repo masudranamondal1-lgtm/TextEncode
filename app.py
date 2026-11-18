@@ -2546,45 +2546,68 @@ def page_manual_annotation() -> None:
         else:
             st.info("This document needs passages and at least one registered entity.")
 
+    
     with link_tab:
         with db.get_connection() as conn:
             entities = db.get_entities(conn, profile_id)
             rel_types = db.get_relationship_types(conn, profile_id)
+
         if len(entities) < 2 or not rel_types:
-            st.info("Register at least two entities and relationship types to create a link.")
+            st.info(
+                "Register at least two entities and relationship types "
+                "to create a link."
+            )
         else:
             entity_options = {
                 f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"]
                 for e in entities
             }
-            type_options = {r["name"]: r["type_id"] for r in rel_types}
-            link_mode = st.radio(
-                "Entity relationship",
-                ["Do not link entities", "Link two entities"],
-                horizontal=True,
-                key="manual_link_mode",
-            )
-            if link_mode == "Link two entities":
-                with st.form("manual_optional_entity_link"):
-                    source = st.selectbox("Source entity", list(entity_options))
-                    target = st.selectbox("Target entity", list(entity_options))
-                    relation = st.selectbox("Relationship type", list(type_options))
-                    description = st.text_area("Description / interpretation")
-                    link = st.form_submit_button("Create link", type="primary")
-                if link:
-                    if source == target:
-                        st.error("Choose two different entities.")
-                    else:
-                        with db.get_connection() as conn:
-                            db.save_relationship(
-                                conn, entity_options[source], entity_options[target],
-                                type_options[relation], description.strip(),
-                            )
-                        st.success("Relationship created. It is currently global because the legacy schema helper does not take a document argument.")
-                        st.rerun()
-            else:
-                st.info("Entity registration and annotation do not require creating a relationship.")
+            type_options = {
+                r["name"]: r["type_id"] for r in rel_types
+            }
+            doc_options = make_document_options(documents)
 
+            with st.form("manual_optional_entity_link"):
+                relationship_doc = st.selectbox(
+                    "Research document",
+                    list(doc_options),
+                )
+                source = st.selectbox(
+                    "Source entity",
+                    list(entity_options),
+                )
+                target = st.selectbox(
+                    "Target entity",
+                    list(entity_options),
+                )
+                relation = st.selectbox(
+                    "Relationship type",
+                    list(type_options),
+                )
+                description = st.text_area(
+                    "Description / interpretation"
+                )
+                link = st.form_submit_button(
+                    "Create document relationship",
+                    type="primary",
+                )
+
+            if link:
+                if source == target:
+                    st.error("Choose two different entities.")
+                else:
+                    with db.get_connection() as conn:
+                        db.save_relationship(
+                            conn,
+                            entity_options[source],
+                            entity_options[target],
+                            type_options[relation],
+                            description.strip(),
+                            doc_id=doc_options[relationship_doc],
+                        )
+
+                    st.success("Document-scoped relationship created.")
+                    st.rerun()
 
 def page_trash() -> None:
     """Restore and permanently delete selected records with explicit confirmation."""
@@ -2904,11 +2927,12 @@ def page_ai_review() -> None:
                         st.error(f"Could not save this annotation: {exc}")
 
 
+
 def page_relationships() -> None:
-    """Create and inspect document-scoped relationships using the real schema."""
+    """Create, inspect, edit and soft-delete document-scoped relationships."""
     components.page_header(
         "Relationship Management",
-        "Connect canonical entities within a selected research document.",
+        "Researcher-controlled relationships, interpretations and evidence.",
     )
     with db.get_connection() as conn:
         documents = db.list_documents(conn)
@@ -2932,17 +2956,19 @@ def page_relationships() -> None:
         f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"]
         for e in entities
     }
+    entity_labels = list(entity_options)
     type_options = {r["name"]: r["type_id"] for r in rel_types}
+    type_names = list(type_options)
 
     with db.get_connection() as conn:
         relations = conn.execute(
             """SELECT r.*, s.canonical_name AS source_name,
                       t.canonical_name AS target_name, rt.name AS type_name
                FROM relationships r
-               JOIN entities s ON s.entity_id=r.source_entity_id
-               JOIN entities t ON t.entity_id=r.target_entity_id
-               JOIN relationship_types rt ON rt.type_id=r.type_id
-               WHERE r.deleted_at IS NULL AND r.doc_id=?
+               JOIN entities s ON s.entity_id = r.source_entity_id
+               JOIN entities t ON t.entity_id = r.target_entity_id
+               JOIN relationship_types rt ON rt.type_id = r.type_id
+               WHERE r.deleted_at IS NULL AND r.doc_id = ?
                ORDER BY r.created_at DESC""",
             (doc_id,),
         ).fetchall()
@@ -2950,76 +2976,114 @@ def page_relationships() -> None:
     view_tab, add_tab = st.tabs(["Document Relationships", "Add Relationship"])
     with view_tab:
         if not relations:
-            st.info("No relationships have been recorded for this document.")
+            st.info("No active relationships have been recorded for this document.")
         for relation in relations:
+            rel_id = relation["relationship_id"]
             with st.container(border=True):
                 st.markdown(
                     f"**{relation['source_name']}** "
-                    f"`[{relation['type_name']}]` "
-                    f"**{relation['target_name']}**"
+                    f"`[{relation['type_name']}]` **{relation['target_name']}**"
                 )
                 if relation["description"]:
                     st.write(relation["description"])
                 st.caption(
-                    f"{relation['relationship_id']} · "
-                    f"Assessment: {relation['confidence'] or 'Unassessed'}"
+                    f"{rel_id} · Assessment: {relation['confidence'] or 'Unassessed'}"
                 )
-                with st.expander("Evidence and management"):
+
+                source_current = next(
+                    (k for k, v in entity_options.items()
+                     if v == relation["source_entity_id"]), entity_labels[0]
+                )
+                target_current = next(
+                    (k for k, v in entity_options.items()
+                     if v == relation["target_entity_id"]), entity_labels[0]
+                )
+                type_current = relation["type_name"] if relation["type_name"] in type_options else type_names[0]
+                assessments = ["Unassessed", "Tentative", "Moderate", "Strong", "Contested"]
+                assessment_current = relation["confidence"] if relation["confidence"] in assessments else "Unassessed"
+
+                with st.expander("Edit relationship"):
+                    with st.form(f"edit_relationship_form_{rel_id}"):
+                        edit_source = st.selectbox(
+                            "Source entity", entity_labels,
+                            index=entity_labels.index(source_current),
+                        )
+                        edit_target = st.selectbox(
+                            "Target entity", entity_labels,
+                            index=entity_labels.index(target_current),
+                        )
+                        edit_type = st.selectbox(
+                            "Relationship type", type_names,
+                            index=type_names.index(type_current),
+                        )
+                        edit_description = st.text_area(
+                            "Description / interpretation",
+                            value=relation["description"] or "",
+                        )
+                        edit_assessment = st.selectbox(
+                            "Research assessment", assessments,
+                            index=assessments.index(assessment_current),
+                        )
+                        update = st.form_submit_button("Save relationship changes", type="primary")
+                    if update:
+                        if edit_source == edit_target:
+                            st.error("Source and target must be different entities.")
+                        else:
+                            try:
+                                with db.get_connection() as conn:
+                                    db.update_relationship(
+                                        conn, rel_id, entity_options[edit_source],
+                                        entity_options[edit_target], type_options[edit_type],
+                                        edit_description.strip(), doc_id=doc_id,
+                                        confidence=edit_assessment,
+                                    )
+                                st.success("Relationship updated.")
+                                safe_rerun()
+                            except Exception as exc:
+                                st.error(f"Could not update relationship: {exc}")
+
+                with st.expander("Evidence"):
                     with db.get_connection() as conn:
-                        evidence = db.get_evidence_for_relationship(
-                            conn, relation["relationship_id"]
-                        )
+                        evidence = db.get_evidence_for_relationship(conn, rel_id)
                     for item in evidence:
-                        st.markdown(f"**{item['evidence_domain']}**")
-                        st.write(item["source_text"])
-                        if item["context"]:
-                            st.caption(item["context"])
-                    with st.form(f"add_rel_evidence_{relation['relationship_id']}"):
+                        with st.container(border=True):
+                            st.markdown(f"**{item['evidence_domain']}**")
+                            st.write(item["source_text"])
+                            if item["context"]:
+                                st.caption(item["context"])
+                            if st.button("Delete evidence", key=f"delete_evidence_{item['evidence_id']}"):
+                                with db.get_connection() as conn:
+                                    db.delete_evidence_bundle(conn, item["evidence_id"])
+                                safe_rerun()
+                    with st.form(f"add_rel_evidence_{rel_id}"):
                         domain = st.selectbox(
-                            "Evidence domain",
-                            ["Literary", "Historical", "Geographical"],
-                            key=f"ev_domain_{relation['relationship_id']}",
+                            "Evidence domain", ["Literary", "Historical", "Geographical"],
+                            key=f"evidence_domain_{rel_id}",
                         )
-                        source_text = st.text_area(
-                            "Evidence text",
-                            key=f"ev_text_{relation['relationship_id']}",
-                        )
-                        context = st.text_input(
-                            "Reference/context",
-                            key=f"ev_context_{relation['relationship_id']}",
-                        )
-                        add = st.form_submit_button("Attach evidence")
-                    if add:
+                        source_text = st.text_area("Evidence passage / source text", key=f"evidence_text_{rel_id}")
+                        context = st.text_input("Reference or context", key=f"evidence_context_{rel_id}")
+                        add_evidence = st.form_submit_button("Attach evidence")
+                    if add_evidence:
                         if not source_text.strip():
                             st.error("Evidence text is required.")
                         else:
                             with db.get_connection() as conn:
-                                db.add_evidence_bundle(
-                                    conn, relation["relationship_id"],
-                                    domain, source_text.strip(), context.strip(),
-                                )
-                            st.rerun()
-                    confirm = st.checkbox(
-                        "Confirm moving this relationship to Trash",
-                        key=f"confirm_rel_trash_{relation['relationship_id']}",
-                    )
-                    if st.button(
-                        "Move relationship to Trash",
-                        disabled=not confirm,
-                        key=f"trash_rel_v2_{relation['relationship_id']}",
-                    ):
-                        with db.get_connection() as conn:
-                            conn.execute(
-                                "UPDATE relationships SET deleted_at=? WHERE relationship_id=?",
-                                (db.utc_now(), relation["relationship_id"]),
-                            )
-                        st.rerun()
+                                db.add_evidence_bundle(conn, rel_id, domain, source_text.strip(), context.strip())
+                            safe_rerun()
+
+                st.warning("Moving this relationship to Trash hides it from active analysis. Its evidence is retained.")
+                confirm = st.checkbox("Confirm moving this relationship to Trash", key=f"confirm_trash_{rel_id}")
+                if st.button("Move relationship to Trash", disabled=not confirm, key=f"trash_relationship_{rel_id}"):
+                    with db.get_connection() as conn:
+                        db.soft_delete_relationship(conn, rel_id)
+                    st.success("Relationship moved to Trash.")
+                    safe_rerun()
 
     with add_tab:
         with st.form("add_doc_scoped_relationship_v2"):
-            source = st.selectbox("Source entity", list(entity_options))
-            target = st.selectbox("Target entity", list(entity_options))
-            relation_type = st.selectbox("Relationship type", list(type_options))
+            source = st.selectbox("Source entity", entity_labels)
+            target = st.selectbox("Target entity", entity_labels)
+            relation_type = st.selectbox("Relationship type", type_names)
             description = st.text_area("Description / interpretation")
             assessment = st.selectbox(
                 "Research assessment",
@@ -3030,22 +3094,17 @@ def page_relationships() -> None:
             if source == target:
                 st.error("Source and target must be different.")
             else:
-                with db.get_connection() as conn:
-                    relation_id = db.next_relationship_id(conn)
-                    conn.execute(
-                        """INSERT INTO relationships
-                        (relationship_id, source_entity_id, target_entity_id,
-                         type_id, description, doc_id, confidence, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            relation_id, entity_options[source], entity_options[target],
+                try:
+                    with db.get_connection() as conn:
+                        relation_id = db.save_relationship(
+                            conn, entity_options[source], entity_options[target],
                             type_options[relation_type], description.strip(),
-                            doc_id, assessment, db.utc_now(),
-                        ),
-                    )
-                st.success("Document-scoped relationship saved.")
-                st.rerun()
-
+                            doc_id=doc_id, confidence=assessment,
+                        )
+                    st.success(f"Relationship saved: {relation_id}")
+                    safe_rerun()
+                except Exception as exc:
+                    st.error(f"Could not save relationship: {exc}")
 
 
 # ---------------------------------------------------------------------

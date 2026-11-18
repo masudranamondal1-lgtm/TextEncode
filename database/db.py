@@ -152,8 +152,21 @@ def update_document_metadata(conn, doc_id: str, title: str, author: str, languag
 def soft_delete_document(conn, doc_id: str) -> None: conn.execute("UPDATE documents SET deleted_at = ? WHERE doc_id = ?", (utc_now(), doc_id))
 def restore_document(conn, doc_id: str) -> None: conn.execute("UPDATE documents SET deleted_at = NULL WHERE doc_id = ?", (doc_id,))
 def permanent_delete_document(conn, doc_id: str) -> None:
+    """Permanently remove a document and its dependent records.
+
+    Passage, mention and candidate rows are removed by their foreign-key
+    ON DELETE CASCADE constraints. FTS5 rows are maintained separately.
+    """
     conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
     conn.execute("DELETE FROM passage_search WHERE doc_id = ?", (doc_id,))
+
+def delete_document(conn, doc_id: str) -> None:
+    """Backward-compatible alias for permanent document deletion.
+
+    Use soft_delete_document() for the normal reversible Trash workflow.
+    This function exists for older callers and tests that expect delete_document.
+    """
+    permanent_delete_document(conn, doc_id)
 
 def get_document(conn, doc_id: str) -> sqlite3.Row | None: return conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
 def get_passages(conn, doc_id: str) -> list[sqlite3.Row]: return conn.execute("SELECT * FROM passages WHERE doc_id = ? ORDER BY sequence", (doc_id,)).fetchall()
@@ -184,26 +197,136 @@ def get_mentions_for_entity(conn, entity_id: str) -> list[sqlite3.Row]:
 
 def delete_mention(conn, mention_id: str) -> None: conn.execute("UPDATE mentions SET deleted_at = ? WHERE mention_id = ?", (utc_now(), mention_id))
 
-def get_relationships(conn) -> list[sqlite3.Row]:
-    return conn.execute("""
-        SELECT r.relationship_id, r.source_entity_id, r.target_entity_id, 
-               s.canonical_name as source_name, t.canonical_name as target_name, 
-               rt.name as type_name, r.description
+
+def get_relationships(
+    conn,
+    doc_id: str | None = None,
+    *,
+    unscoped_only: bool = False,
+) -> list[sqlite3.Row]:
+    """Return active relationships, optionally restricted to a document."""
+    query = """
+        SELECT
+            r.relationship_id,
+            r.source_entity_id,
+            r.target_entity_id,
+            s.canonical_name AS source_name,
+            t.canonical_name AS target_name,
+            rt.name AS type_name,
+            r.description,
+            r.doc_id,
+            r.confidence,
+            r.note,
+            r.created_at
         FROM relationships r
         JOIN entities s ON r.source_entity_id = s.entity_id
         JOIN entities t ON r.target_entity_id = t.entity_id
         JOIN relationship_types rt ON r.type_id = rt.type_id
         WHERE r.deleted_at IS NULL
-    """).fetchall()
+    """
+    params = []
 
-def update_relationship(conn, rel_id: str, source_id: str, target_id: str, type_id: int, description: str) -> None:
-    conn.execute("UPDATE relationships SET source_entity_id = ?, target_entity_id = ?, type_id = ?, description = ? WHERE relationship_id = ?", (source_id, target_id, type_id, description, rel_id))
+    if doc_id is not None:
+        query += " AND r.doc_id = ?"
+        params.append(doc_id)
+    elif unscoped_only:
+        query += " AND r.doc_id IS NULL"
 
-def save_relationship(conn, source_id: str, target_id: str, type_id: int, description: str) -> None:
+    query += " ORDER BY r.created_at DESC"
+    return conn.execute(query, params).fetchall()
+
+
+def save_relationship(
+    conn,
+    source_id: str,
+    target_id: str,
+    type_id: int,
+    description: str,
+    doc_id: str | None = None,
+    confidence: str | None = None,
+) -> str:
+    """Create a relationship with optional document scope."""
     rel_id = next_relationship_id(conn)
-    conn.execute("INSERT INTO relationships (relationship_id, source_entity_id, target_entity_id, type_id, description, created_at) VALUES (?, ?, ?, ?, ?, ?)", (rel_id, source_id, target_id, type_id, description, utc_now()))
 
-def delete_relationship(conn, rel_id: str) -> None: conn.execute("DELETE FROM relationships WHERE relationship_id = ?", (rel_id,))
+    conn.execute(
+        """
+        INSERT INTO relationships (
+            relationship_id,
+            source_entity_id,
+            target_entity_id,
+            type_id,
+            description,
+            doc_id,
+            confidence,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rel_id,
+            source_id,
+            target_id,
+            type_id,
+            description,
+            doc_id,
+            confidence,
+            utc_now(),
+        ),
+    )
+    return rel_id
+
+def update_relationship(
+    conn,
+    rel_id: str,
+    source_id: str,
+    target_id: str,
+    type_id: int,
+    description: str,
+    doc_id: str | None = None,
+    confidence: str | None = None,
+) -> None:
+    """Update a relationship and its document scope."""
+    if source_id == target_id:
+        raise ValueError("A relationship must connect two different entities.")
+    cursor = conn.execute(
+        """UPDATE relationships
+           SET source_entity_id = ?, target_entity_id = ?, type_id = ?,
+               description = ?, doc_id = ?, confidence = ?
+           WHERE relationship_id = ? AND deleted_at IS NULL""",
+        (source_id, target_id, type_id, description, doc_id, confidence, rel_id),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError(f"Active relationship not found: {rel_id}")
+
+
+def soft_delete_relationship(conn, rel_id: str) -> None:
+    """Move a relationship to Trash without deleting its evidence."""
+    cursor = conn.execute(
+        """UPDATE relationships SET deleted_at = ?
+           WHERE relationship_id = ? AND deleted_at IS NULL""",
+        (utc_now(), rel_id),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError(f"Active relationship not found: {rel_id}")
+
+
+def restore_relationship(conn, rel_id: str) -> None:
+    """Restore a relationship from Trash."""
+    cursor = conn.execute(
+        """UPDATE relationships SET deleted_at = NULL
+           WHERE relationship_id = ? AND deleted_at IS NOT NULL""",
+        (rel_id,),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError(f"Deleted relationship not found: {rel_id}")
+
+
+def delete_relationship(conn, rel_id: str) -> None:
+    """Legacy irreversible delete. Prefer soft_delete_relationship."""
+    conn.execute(
+        "DELETE FROM relationships WHERE relationship_id = ?",
+        (rel_id,),
+    )
 
 # --- EVIDENCE BUNDLES ---
 def get_evidence_for_relationship(conn, rel_id: str) -> list[sqlite3.Row]:
