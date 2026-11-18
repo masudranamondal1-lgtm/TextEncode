@@ -19,9 +19,6 @@ from database import db
 from modules import parser, exporter, ai_recognizer, text_analysis
 from ui import theme, components, decorations, settings_page
 
-# ---------------------------------------------------------------------
-# APPLICATION INITIALISATION
-# ---------------------------------------------------------------------
 st.set_page_config(page_title="TextEncode", page_icon="📖", layout="wide", initial_sidebar_state="expanded")
 
 DEFAULTS = {"theme_mode": "Classic Light", "reading_font_size": 1.15, "reading_line_height": 1.8, "reading_width": 800}
@@ -40,9 +37,6 @@ try:
 except Exception as exc:
     st.warning(f"Theme could not be applied: {exc}")
 
-# ---------------------------------------------------------------------
-# SHARED HELPERS
-# ---------------------------------------------------------------------
 def safe_rerun() -> None:
     st.rerun()
 
@@ -76,36 +70,6 @@ def highlight_mentions(text: str, mentions: list[dict]) -> str:
         cursor = end
     output.append(html.escape(text[cursor:]))
     return "".join(output)
-def scoped_entity_rows(conn, profile_id: int, doc_id: str | None = None) -> list[Any]:
-    """List entities with mention counts, optionally within one document.
-
-    Canonical entities remain reusable. A document-specific mention links
-    an entity to a passage in that document.
-    """
-    if doc_id:
-        return conn.execute(
-            """
-            SELECT
-                e.entity_id,
-                e.canonical_name,
-                e.alt_names,
-                e.description,
-                c.name AS category_name,
-                COUNT(m.mention_id) AS mention_count
-            FROM entities e
-            JOIN entity_categories c ON c.category_id = e.category_id
-            LEFT JOIN mentions m
-                ON m.entity_id = e.entity_id
-                AND m.doc_id = ?
-                AND m.deleted_at IS NULL
-            WHERE e.profile_id = ?
-              AND e.deleted_at IS NULL
-            GROUP BY e.entity_id
-            ORDER BY mention_count DESC, e.canonical_name COLLATE NOCASE
-            """,
-            (doc_id, profile_id),
-        ).fetchall()
-    return db.get_all_entities_with_stats(conn, profile_id)
 
 def find_all_occurrences(text: str, needle: str) -> list[tuple[int, int]]:
     if not needle:
@@ -195,9 +159,22 @@ def _project_document_scope(key_prefix: str):
     doc_id = options[selected]
     return [d for d in all_documents if d["doc_id"] == doc_id], doc_id
 
-# ---------------------------------------------------------------------
+def scoped_entity_rows(conn, profile_id: int, doc_id=None):
+    if doc_id:
+        return conn.execute("SELECT e.entity_id, e.canonical_name, e.alt_names, e.description, c.name AS category_name, COUNT(m.mention_id) AS mention_count FROM entities e JOIN entity_categories c ON c.category_id = e.category_id LEFT JOIN mentions m ON m.entity_id = e.entity_id AND m.doc_id = ? AND m.deleted_at IS NULL WHERE e.profile_id = ? AND e.deleted_at IS NULL GROUP BY e.entity_id ORDER BY mention_count DESC, e.canonical_name COLLATE NOCASE", (doc_id, profile_id)).fetchall()
+    return db.get_all_entities_with_stats(conn, profile_id)
+
+def _centroid_from_coords(coords):
+    pts = [c for c in coords if isinstance(c, (list, tuple)) and len(c) >= 2]
+    if not pts:
+        return None, None
+    lon = sum(p[0] for p in pts) / len(pts)
+    lat = sum(p[1] for p in pts) / len(pts)
+    return lat, lon
+
+# =====================================================================
 # PAGES
-# ---------------------------------------------------------------------
+# =====================================================================
 def page_dashboard() -> None:
     components.page_header("Research Dashboard", "An overview of your TextEncode research workspace.")
     decorations.network_ornament()
@@ -237,12 +214,9 @@ def page_dashboard() -> None:
         st.download_button("Download Database Backup", data=backup_path.read_bytes(), file_name=backup_path.name, mime="application/x-sqlite3", key="download_latest_database_backup")
 
 def page_projects() -> None:
-    components.page_header(
-        "Research Projects",
-        "Create, edit, duplicate, move documents between, and recover projects and corpora.",
-    )
+    components.page_header("Research Projects", "Create, edit, duplicate, move documents between, and recover projects and corpora.")
     with db.get_connection() as conn:
-        projects = db.get_projects(conn)
+        projects = db.list_projects(conn)
     view_tab, create_tab = st.tabs(["Projects", "Create Project"])
     with create_tab:
         with st.form("create_project_form"):
@@ -286,25 +260,19 @@ def page_projects() -> None:
                     safe_rerun()
                 if perm:
                     if not st.session_state.get(f"confirm_perm_proj_{pid}"):
-                        st.session_state[f"confirm_perm_proj_{pid}"] = st.checkbox(
-                            "I understand: this deletes all corpora and documents in this project",
-                            key=f"chk_perm_proj_{pid}",
-                        )
+                        st.session_state[f"confirm_perm_proj_{pid}"] = st.checkbox("I understand: this deletes all corpora and documents in this project", key=f"chk_perm_proj_{pid}")
                         st.stop()
                     with db.get_connection() as conn:
                         db.hard_delete_project(conn, pid)
                     safe_rerun()
-
-                # Load corpora, docs and move-targets in ONE open connection.
                 with db.get_connection() as conn:
                     corpora = db.get_corpora(conn, pid)
                     docs = db.list_documents(conn)
-                    move_map: dict[str, int] = {}
+                    move_map = {}
                     for p in projects:
                         for c in db.get_corpora(conn, p["project_id"]):
                             move_map[f"{p['name']} / {c['name']} (#{c['corpus_id']})"] = c["corpus_id"]
-                move_labels = list(move_map)
-
+                    move_labels = list(move_map)
                 st.markdown("**Corpora & documents**")
                 for corpus in corpora:
                     cid = corpus["corpus_id"]
@@ -327,18 +295,13 @@ def page_projects() -> None:
                         corpus_docs = [d for d in docs if d["corpus_id"] == cid]
                         if corpus_docs:
                             for d in corpus_docs:
-                                mv = st.selectbox(
-                                    f"Move {d['doc_id']} to:",
-                                    move_labels,
-                                    key=f"mv_{d['doc_id']}",
-                                )
+                                mv = st.selectbox(f"Move {d['doc_id']} to:", move_labels, key=f"mv_{d['doc_id']}")
                                 if st.button("Move here", key=f"mvbtn_{d['doc_id']}"):
                                     with db.get_connection() as conn:
                                         db.move_document_to_corpus(conn, d["doc_id"], move_map[mv])
                                     safe_rerun()
                         else:
                             st.caption("No active documents in this corpus.")
-
 
 def page_documents() -> None:
     components.page_header("Document Library", "Import, inspect, edit and organise research documents.")
@@ -474,6 +437,166 @@ def page_reader() -> None:
             st.markdown(f"<div class='reader-container'>{rendered}</div>", unsafe_allow_html=True)
             st.caption(f"{passage['passage_id']} · {passage['passage_type']} · Sequence {passage['sequence']}")
 
+def page_text_analysis() -> None:
+    components.page_header("Text Analysis", "Analyse one document, a corpus, a project or all active documents.")
+    scoped_docs, scope_id = _project_document_scope("text_analysis")
+    if not scoped_docs:
+        st.info("The selected scope contains no active documents.")
+        return
+    texts = []
+    with db.get_connection() as conn:
+        for document in scoped_docs:
+            row = db.get_document(conn, document["doc_id"])
+            if row:
+                texts.append(row["source_text"] or "")
+    full_text = "\n\n".join(texts)
+    if not full_text.strip():
+        st.info("The selected scope contains no text.")
+        return
+    st.caption(f"Analysing {len(scoped_docs)} document(s).")
+    stats_tab, freq_tab, ngram_tab, kwic_tab = st.tabs(["Overview", "Word Frequency", "N-Grams", "Concordance (KWIC)"])
+    with stats_tab:
+        stats = cached_stats(full_text)
+        components.metric_row([{"label": str(k).replace("_", " ").title(), "value": v} for k, v in stats.items()])
+    with freq_tab:
+        limit = st.slider("Top terms", 10, 200, 50, 10, key="scoped_freq_limit")
+        values = cached_frequency(full_text, limit)
+        if values:
+            st.dataframe(pd.DataFrame(values, columns=["Term", "Frequency"]), hide_index=True, width="stretch")
+        else:
+            st.info("No frequency results.")
+    with ngram_tab:
+        n = st.radio("N-gram size", [2, 3, 4], horizontal=True, key="scoped_ngram_size")
+        values = cached_ngrams(full_text, n, 50)
+        if values:
+            st.dataframe(pd.DataFrame(values, columns=["N-gram", "Frequency"]), hide_index=True, width="stretch")
+        else:
+            st.info("No n-gram results.")
+    with kwic_tab:
+        query = st.text_input("Search term", key="scoped_kwic_query")
+        if query.strip():
+            values = text_analysis.get_kwic(full_text, query.strip())
+            if values:
+                frame = pd.DataFrame(values)
+                cols = [c for c in ["left", "match", "right"] if c in frame.columns]
+                st.dataframe(frame[cols], hide_index=True, width="stretch")
+            else:
+                st.info("No matching contexts found.")
+
+def page_network_analysis() -> None:
+    components.page_header("Network Analysis", "Explore researcher-defined entity relationships.")
+    scoped_docs, _ = _project_document_scope("network")
+    if not scoped_docs:
+        st.info("No documents in this scope.")
+        return
+    doc_ids = [d["doc_id"] for d in scoped_docs]
+    placeholders = ",".join("?" for _ in doc_ids)
+    with db.get_connection() as conn:
+        relations = conn.execute(f"SELECT r.relationship_id, r.source_entity_id, r.target_entity_id, s.canonical_name AS source_name, t.canonical_name AS target_name, rt.name AS type_name, r.description, r.doc_id FROM relationships r JOIN entities s ON s.entity_id = r.source_entity_id JOIN entities t ON t.entity_id = r.target_entity_id JOIN relationship_types rt ON rt.type_id = r.type_id WHERE r.deleted_at IS NULL AND (r.doc_id IN ({placeholders}) OR r.doc_id IS NULL) ORDER BY r.created_at", doc_ids).fetchall()
+    if not relations:
+        st.info("No relationships found in this scope.")
+        return
+    from streamlit_agraph import agraph, Node, Edge, Config
+    nodes, edges = {}, []
+    for relation in relations:
+        source_id, target_id = relation["source_entity_id"], relation["target_entity_id"]
+        nodes.setdefault(source_id, Node(id=source_id, label=relation["source_name"], size=22, color="#244C56"))
+        nodes.setdefault(target_id, Node(id=target_id, label=relation["target_name"], size=22, color="#A7895B"))
+        edges.append(Edge(source=source_id, target=target_id, label=relation["type_name"], color="#E5E2DB"))
+    st.caption(f"{len(scoped_docs)} document(s) · {len(nodes)} entities · {len(edges)} relationship records")
+    agraph(nodes=list(nodes.values()), edges=edges, config=Config(width="100%", height=650, directed=True, physics=True, hierarchical=False, nodeHighlightBehavior=True, highlightColor="#F7A7A6", collapsible=False))
+    with st.expander("Relationship data"):
+        st.dataframe(pd.DataFrame(rows_as_dicts(relations)), hide_index=True, width="stretch")
+
+def page_spatial_analysis() -> None:
+    components.page_header("Spatial Analysis", "Map point, line and polygon entities within a scope.")
+    scoped_docs, _ = _project_document_scope("spatial")
+    if not scoped_docs:
+        st.info("No documents in this scope.")
+        return
+    doc_ids = [d["doc_id"] for d in scoped_docs]
+    ph = ", ".join("?" for _ in doc_ids)
+    with db.get_connection() as conn:
+        profile = get_active_profile(conn)
+        if not profile:
+            st.warning("Select a taxonomy profile.")
+            return
+        entities = conn.execute(f"SELECT DISTINCT e.entity_id, e.canonical_name, e.latitude, e.longitude, e.geometry_type, e.geometry_json, c.name AS category_name FROM entities e JOIN entity_categories c ON c.category_id = e.category_id LEFT JOIN mentions m ON m.entity_id = e.entity_id AND m.deleted_at IS NULL WHERE e.profile_id = ? AND e.deleted_at IS NULL AND (e.doc_id IN ({ph}) OR m.doc_id IN ({ph})) ORDER BY e.canonical_name", [profile["profile_id"]] + doc_ids + doc_ids).fetchall()
+    rows = [dict(e) for e in entities]
+    point_rows = [r for r in rows if r["latitude"] is not None and r["longitude"] is not None]
+    line_data, poly_data = [], []
+    for r in rows:
+        if not r["geometry_json"]:
+            continue
+        try:
+            g = json.loads(r["geometry_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if g["type"] in ("LineString",):
+            line_data.append({"path": g["coordinates"], "name": r["canonical_name"]})
+        elif g["type"] in ("MultiLineString",):
+            for seg in g["coordinates"]:
+                line_data.append({"path": seg, "name": r["canonical_name"]})
+        elif g["type"] == "Polygon":
+            poly_data.append({"polygon": g["coordinates"], "name": r["canonical_name"]})
+        elif g["type"] == "MultiPolygon":
+            for poly in g["coordinates"]:
+                poly_data.append({"polygon": poly, "name": r["canonical_name"]})
+    layers = []
+    if point_rows:
+        layers.append(pdk.Layer("ScatterplotLayer", data=point_rows, get_position=["longitude", "latitude"], get_radius=120, get_color=[36, 76, 86], pickable=True))
+    if line_data:
+        layers.append(pdk.Layer("PathLayer", data=line_data, get_path="path", get_color=[167, 137, 91], width_min_pixels=3))
+    if poly_data:
+        layers.append(pdk.Layer("PolygonLayer", data=poly_data, get_polygon="polygon", filled=True, get_fill_color=[36, 76, 86, 120], getLineColor=[229, 226, 219]))
+    if layers:
+        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=22.98, longitude=87.7, zoom=7, pitch=40)))
+    elif point_rows:
+        st.map(pd.DataFrame([{"lat": r["latitude"], "lon": r["longitude"]} for r in point_rows]), latitude="lat", longitude="lon")
+    else:
+        st.info("No georeferenced entities in this scope.")
+    st.divider()
+    with st.expander("🗺️ Add or edit entity coordinates & provenance", expanded=True):
+        if not rows:
+            st.info("No entities in scope.")
+            return
+        opts = {f"{e['entity_id']} — {e['canonical_name']}": e for e in rows}
+        sel = st.selectbox("Entity", list(opts), key="spatial_entity")
+        entity = opts[sel]
+        with db.get_connection() as conn:
+            ext_ids = conn.execute("SELECT ea.provider_name, ei.external_identifier, ei.external_uri FROM entity_identifiers ei JOIN external_authorities ea ON ei.authority_id = ea.authority_id WHERE ei.entity_id = ? AND ei.match_status = 'accepted'", (entity["entity_id"],)).fetchall()
+        if ext_ids:
+            st.markdown("**Accepted External Identifiers:**")
+            for ext in ext_ids:
+                st.markdown(f"- **{ext['provider_name']}**: [{ext['external_identifier']}]({ext['external_uri']})")
+            st.caption("💡 Tip: Click the link above to verify coordinates on the authority site before saving.")
+        else:
+            st.info("No accepted external identifiers for this entity.")
+        with st.form("spatial_coordinate_form"):
+            lat = st.number_input("Latitude", value=float(entity["latitude"] or 0.0), min_value=-90.0, max_value=90.0, format="%.6f")
+            lon = st.number_input("Longitude", value=float(entity["longitude"] or 0.0), min_value=-180.0, max_value=180.0, format="%.6f")
+            coord_source_options = ["researcher", "authority-adopted", "historical-estimate"]
+            current_source = entity.get("coordinate_source") or "researcher"
+            source_idx = coord_source_options.index(current_source) if current_source in coord_source_options else 0
+            coord_source = st.selectbox("Coordinate Provenance", coord_source_options, index=source_idx)
+            status_options = ["Certain", "Uncertain", "Approximate", "Historical"]
+            current_status = entity.get("location_status") or "Uncertain"
+            status_idx = status_options.index(current_status) if current_status in status_options else 1
+            loc_status = st.selectbox("Location Status", status_options, index=status_idx)
+            col1, col2 = st.columns(2)
+            save = col1.form_submit_button("Save coordinates", type="primary")
+            clear = col2.form_submit_button("Clear coordinates")
+        if save:
+            with db.get_connection() as conn:
+                conn.execute("UPDATE entities SET latitude=?, longitude=?, coordinate_source=?, location_status=? WHERE entity_id=?", (lat, lon, coord_source, loc_status, entity["entity_id"]))
+            st.success("Coordinates and provenance saved.")
+            safe_rerun()
+        if clear:
+            with db.get_connection() as conn:
+                conn.execute("UPDATE entities SET latitude=NULL, longitude=NULL, coordinate_source='researcher', location_status='Uncertain' WHERE entity_id=?", (entity["entity_id"],))
+            st.success("Coordinates cleared.")
+            safe_rerun()
+
 def page_manual_annotation() -> None:
     components.page_header("Manual Annotation", "Register one entity, annotate a passage, and optionally link entities.")
     with db.get_connection() as conn:
@@ -559,64 +682,16 @@ def page_manual_annotation() -> None:
                         db.save_relationship(conn, entity_options[source], entity_options[target], type_options[relation], description.strip(), doc_id=doc_options[relationship_doc])
                     safe_rerun()
 
-def page_text_analysis() -> None:
-    components.page_header("Text Analysis", "Analyse one document, a corpus, a project or all active documents.")
-    scoped_docs, scope_id = _project_document_scope("text_analysis")
-    if not scoped_docs:
-        st.info("The selected scope contains no active documents.")
-        return
-    texts = []
-    with db.get_connection() as conn:
-        for document in scoped_docs:
-            row = db.get_document(conn, document["doc_id"])
-            if row:
-                texts.append(row["source_text"] or "")
-    full_text = "\n\n".join(texts)
-    if not full_text.strip():
-        st.info("The selected scope contains no text.")
-        return
-    st.caption(f"Analysing {len(scoped_docs)} document(s).")
-    stats_tab, freq_tab, ngram_tab, kwic_tab = st.tabs(["Overview", "Word Frequency", "N-Grams", "Concordance (KWIC)"])
-    with stats_tab:
-        stats = cached_stats(full_text)
-        components.metric_row([{"label": str(k).replace("_", " ").title(), "value": v} for k, v in stats.items()])
-    with freq_tab:
-        limit = st.slider("Top terms", 10, 200, 50, 10, key="scoped_freq_limit")
-        values = cached_frequency(full_text, limit)
-        if values:
-            st.dataframe(pd.DataFrame(values, columns=["Term", "Frequency"]), hide_index=True, width="stretch")
-        else:
-            st.info("No frequency results.")
-    with ngram_tab:
-        n = st.radio("N-gram size", [2, 3, 4], horizontal=True, key="scoped_ngram_size")
-        values = cached_ngrams(full_text, n, 50)
-        if values:
-            st.dataframe(pd.DataFrame(values, columns=["N-gram", "Frequency"]), hide_index=True, width="stretch")
-        else:
-            st.info("No n-gram results.")
-    with kwic_tab:
-        query = st.text_input("Search term", key="scoped_kwic_query")
-        if query.strip():
-            values = text_analysis.get_kwic(full_text, query.strip())
-            if values:
-                frame = pd.DataFrame(values)
-                cols = [c for c in ["left", "match", "right"] if c in frame.columns]
-                st.dataframe(frame[cols], hide_index=True, width="stretch")
-            else:
-                st.info("No matching contexts found.")
-
 def page_entities() -> None:
-    components.page_header(
-        "Entity Catalogue",
-        "Manage canonical entities, inspect document-specific mentions, and reconcile with external authorities.",
-    )
+    components.page_header("Entity Catalogue", "Manage canonical entities, inspect document-specific mentions, and reconcile with external authorities.")
     with db.get_connection() as conn:
-        profiles = db.get_profiles(conn)
+        profiles = db.list_profiles(conn)
         documents = db.list_documents(conn)
-    if not profiles:
+        profile = get_active_profile(conn)
+    if not profiles or not profile:
         render_empty("Create a taxonomy profile before registering entities.")
         return
-    profile_id = profiles[0]["profile_id"]
+    profile_id = profile["profile_id"]
     with db.get_connection() as conn:
         categories = db.get_categories(conn, profile_id)
         entities = db.get_all_entities_with_stats(conn, profile_id)
@@ -624,62 +699,32 @@ def page_entities() -> None:
         render_empty("The selected taxonomy profile has no categories.")
         return
     category_options = {category["name"]: category["category_id"] for category in categories}
-
-    # 5 Tabs including the new External Identity tab
-    view_tab, add_tab, edit_tab, document_tab, external_tab = st.tabs(
-        ["Catalogue", "Add Seed Entity", "Edit Entity", "By Document", "External Identity"]
-    )
-
-    # -------------------------------------------------------------------------
-    # TAB 1: Catalogue
-    # -------------------------------------------------------------------------
+    view_tab, add_tab, edit_tab, document_tab, external_tab = st.tabs(["Catalogue", "Add Seed Entity", "Edit Entity", "By Document", "External Identity"])
     with view_tab:
         if not entities:
             st.info("No entities have been registered.")
         else:
             frame = pd.DataFrame(rows_as_dicts(entities))
-            col_search, col_category = st.columns([2, 1])
-            search = col_search.text_input("Search entity name or alias", key="entity_search")
-            category_filter = col_category.selectbox(
-                "Category", ["All"] + list(category_options.keys()), key="entity_category_filter"
-            )
-            if search:
-                pattern = search.strip()
-                frame = frame[
-                    frame["canonical_name"].fillna("").str.contains(pattern, case=False, regex=False)
-                    | frame["alt_names"].fillna("").str.contains(pattern, case=False, regex=False)
-                ]
-            if category_filter != "All":
-                frame = frame[frame["category_name"] == category_filter]
-            
-            # Attempt to add external link columns if the Phase 4 schema is present
             try:
                 with db.get_connection() as conn:
-                    has_ids = conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_identifiers'"
-                    ).fetchone()
-                    if has_ids:
-                        ext_rows = conn.execute(
-                            """SELECT entity_id, COUNT(*) AS ext_count, GROUP_CONCAT(external_identifier) AS ext_ids
-                               FROM entity_identifiers GROUP BY entity_id"""
-                        ).fetchall()
-                        counts = {r["entity_id"]: (r["ext_count"], r["ext_ids"]) for r in ext_rows}
-                        frame["external_links"] = frame["entity_id"].map(lambda eid: counts.get(eid, (0, ""))[0])
-                        frame["external_ids"] = frame["entity_id"].map(lambda eid: counts.get(eid, (0, ""))[1])
+                    has_ids = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_identifiers'").fetchone()
+                    ext_rows = conn.execute("SELECT entity_id, COUNT(*) AS ext_count, GROUP_CONCAT(external_identifier) AS ext_ids FROM entity_identifiers GROUP BY entity_id").fetchall() if has_ids else []
+                counts = {r["entity_id"]: (r["ext_count"], r["ext_ids"]) for r in ext_rows}
+                frame["external_links"] = frame["entity_id"].map(lambda eid: counts.get(eid, (0, ""))[0])
+                frame["external_ids"] = frame["entity_id"].map(lambda eid: counts.get(eid, (0, ""))[1])
             except Exception:
-                pass  # Fallback silently if schema is not yet updated
-
-            visible_columns = [
-                c for c in [
-                    "entity_id", "canonical_name", "alt_names", "category_name", 
-                    "mention_count", "external_links", "external_ids"
-                ] if c in frame.columns
-            ]
+                frame["external_links"] = 0
+                frame["external_ids"] = ""
+            col_search, col_category = st.columns([2, 1])
+            search = col_search.text_input("Search entity name or alias", key="entity_search")
+            category_filter = col_category.selectbox("Category", ["All"] + list(category_options.keys()), key="entity_category_filter")
+            if search:
+                pattern = search.strip()
+                frame = frame[frame["canonical_name"].fillna("").str.contains(pattern, case=False, regex=False) | frame["alt_names"].fillna("").str.contains(pattern, case=False, regex=False)]
+            if category_filter != "All":
+                frame = frame[frame["category_name"] == category_filter]
+            visible_columns = [c for c in ["entity_id", "canonical_name", "alt_names", "category_name", "mention_count", "external_links", "external_ids"] if c in frame.columns]
             st.dataframe(frame[visible_columns], hide_index=True, width="stretch")
-
-    # -------------------------------------------------------------------------
-    # TAB 2: Add Seed Entity
-    # -------------------------------------------------------------------------
     with add_tab:
         with st.form("add_seed_entity_form"):
             canonical_name = st.text_input("Canonical name *")
@@ -694,24 +739,10 @@ def page_entities() -> None:
                 try:
                     with db.get_connection() as conn:
                         entity_id = db.next_entity_id(conn)
-                        conn.execute(
-                            """INSERT INTO entities
-                            (entity_id, profile_id, canonical_name, category_id, alt_names, description, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                entity_id, profile_id, canonical_name.strip(),
-                                category_options[category_name], aliases.strip() or None,
-                                description.strip() or None, db.utc_now(),
-                            ),
-                        )
-                    st.success(f"Registered {canonical_name.strip()} as {entity_id}.")
+                        conn.execute("INSERT INTO entities (entity_id, profile_id, canonical_name, category_id, alt_names, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (entity_id, profile_id, canonical_name.strip(), category_options[category_name], aliases.strip() or None, description.strip() or None, db.utc_now()))
                     safe_rerun()
                 except Exception as exc:
                     st.error(f"Could not register entity: {exc}")
-
-    # -------------------------------------------------------------------------
-    # TAB 3: Edit Entity
-    # -------------------------------------------------------------------------
     with edit_tab:
         if not entities:
             st.info("There are no entities to edit.")
@@ -733,20 +764,13 @@ def page_entities() -> None:
                     st.error("Canonical name cannot be empty.")
                 else:
                     with db.get_connection() as conn:
-                        db.update_entity_details(
-                            conn, entity["entity_id"], new_name.strip(),
-                            category_options[new_category], new_aliases.strip() or None,
-                            new_description.strip() or None,
-                        )
-                    st.success("Entity updated.")
+                        db.update_entity_details(conn, entity["entity_id"], new_name.strip(), category_options[new_category], new_aliases.strip() or None, new_description.strip() or None)
                     safe_rerun()
-            
             st.warning("Moving an entity to Trash hides it from active catalogues. Existing mentions remain stored.")
             if st.button("Move Entity to Trash", key=f"trash_entity_{entity['entity_id']}"):
                 with db.get_connection() as conn:
                     db.soft_delete_entity(conn, entity["entity_id"])
                 safe_rerun()
-            
             st.subheader("Mentions of this entity")
             with db.get_connection() as conn:
                 mentions = db.get_mentions_for_entity(conn, entity["entity_id"])
@@ -762,10 +786,6 @@ def page_entities() -> None:
                             safe_rerun()
             else:
                 st.info("No active mentions are linked to this entity.")
-
-    # -------------------------------------------------------------------------
-    # TAB 4: By Document
-    # -------------------------------------------------------------------------
     with document_tab:
         if not documents:
             st.info("Import documents to inspect document-specific entities.")
@@ -775,14 +795,7 @@ def page_entities() -> None:
             doc_id = doc_options[selected_doc]
             with db.get_connection() as conn:
                 document_entities = scoped_entity_rows(conn, profile_id, doc_id)
-                mention_rows = conn.execute(
-                    """SELECT m.mention_id, m.entity_id, e.canonical_name, m.surface_form, m.passage_id,
-                              m.char_start, m.char_end, m.status, m.note
-                       FROM mentions m JOIN entities e ON e.entity_id = m.entity_id
-                       WHERE m.doc_id = ? AND m.deleted_at IS NULL
-                       ORDER BY m.passage_id, m.char_start""",
-                    (doc_id,),
-                ).fetchall()
+                mention_rows = conn.execute("SELECT m.mention_id, m.entity_id, e.canonical_name, m.surface_form, m.passage_id, m.char_start, m.char_end, m.status, m.note FROM mentions m JOIN entities e ON e.entity_id = m.entity_id WHERE m.doc_id = ? AND m.deleted_at IS NULL ORDER BY m.passage_id, m.char_start", (doc_id,)).fetchall()
             st.subheader("Entities mentioned in this document")
             present = [dict(row) for row in document_entities if row["mention_count"] > 0]
             if present:
@@ -794,31 +807,20 @@ def page_entities() -> None:
                 st.dataframe(pd.DataFrame(rows_as_dicts(mention_rows)), hide_index=True, width="stretch")
             else:
                 st.info("No mentions are registered for this document.")
-
-    # -------------------------------------------------------------------------
-    # TAB 5: External Identity (Phase 4)
-    # -------------------------------------------------------------------------
     with external_tab:
         st.subheader("External Authority Reconciliation")
         st.caption("Connect internal entities to external knowledge bases. Researcher authority is required for all matches.")
-        
         if not entities:
             st.info("Register an entity first to begin reconciliation.")
             return
-            
         entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in entities}
-        selected_entity_label = st.selectbox(
-            "Select Entity to Reconcile", list(entity_options.keys()), key="reconcile_entity_select"
-        )
+        selected_entity_label = st.selectbox("Select Entity to Reconcile", list(entity_options.keys()), key="reconcile_entity_select")
         entity_id = entity_options[selected_entity_label]
-        
         with db.get_connection() as conn:
-            # Ensure default authorities are seeded
             db.init_external_authorities(conn)
             identifiers = [dict(i) for i in db.get_external_identifiers(conn, entity_id)]
             candidates = [dict(c) for c in db.get_candidates_for_entity(conn, entity_id, "suggested")]
             authorities = [dict(a) for a in db.get_enabled_authorities(conn)]
-            
         st.markdown("### 1. Accepted Identifiers")
         if identifiers:
             for ident in identifiers:
@@ -831,7 +833,6 @@ def page_entities() -> None:
                         safe_rerun()
         else:
             st.info("No external identifiers linked yet.")
-            
         st.divider()
         st.markdown("### 2. Search External Authorities")
         if not authorities:
@@ -840,10 +841,8 @@ def page_entities() -> None:
             auth_options = {a["provider_name"]: a["authority_id"] for a in authorities}
             selected_auth_name = st.selectbox("Provider", list(auth_options.keys()), key="reconcile_auth_select")
             auth_id = auth_options[selected_auth_name]
-            
             query = st.text_input("Search Query (use the entity's real name)", key="reconcile_query")
             lang = st.radio("Language", ["en", "bn"], horizontal=True, key="reconcile_lang")
-            
             if st.button("Search", type="primary", key="reconcile_search_btn"):
                 if not query.strip():
                     st.error("Enter a search query.")
@@ -854,11 +853,10 @@ def page_entities() -> None:
                         try:
                             from modules.authorities.wikidata import WikidataProvider
                             results = WikidataProvider().search(query.strip(), language=lang)
-                            
                             if results:
                                 with db.get_connection() as conn:
-                                    count = db.save_reconciliation_candidates(conn, entity_id, auth_id, results, query.strip())
-                                st.success(f"Found {len(results)} result(s). {count} new candidates saved.")
+                                    db.save_reconciliation_candidates(conn, entity_id, auth_id, results, query.strip())
+                                st.success(f"Found {len(results)} result(s).")
                                 safe_rerun()
                             else:
                                 st.info("No results found. Try an English proper name (e.g., 'Tagore', 'Kolkata').")
@@ -866,7 +864,6 @@ def page_entities() -> None:
                             st.error(str(e))
                         except Exception as e:
                             st.error(f"Search failed: {e}")
-
         st.divider()
         st.markdown("### 3. Review Candidates")
         if candidates:
@@ -878,14 +875,10 @@ def page_entities() -> None:
                         st.caption(c["external_description"])
                     if c.get("alternative_names"):
                         st.caption(f"Aliases: {c['alternative_names']}")
-                    
                     col1, col2, col3 = st.columns(3)
                     if col1.button("✅ Accept", key=f"acc_{c['candidate_id']}"):
                         with db.get_connection() as conn:
-                            db.add_entity_identifier(
-                                conn, entity_id, c["authority_id"],
-                                c["external_identifier"], c["external_uri"], c["external_label"]
-                            )
+                            db.add_entity_identifier(conn, entity_id, c["authority_id"], c["external_identifier"], c["external_uri"], c["external_label"])
                             db.update_reconciliation_candidate_status(conn, c["candidate_id"], "accepted")
                         safe_rerun()
                     if col2.button("❌ Reject", key=f"rej_{c['candidate_id']}"):
@@ -898,124 +891,6 @@ def page_entities() -> None:
                         safe_rerun()
         else:
             st.info("No pending candidates. Run a search above.")
-
-def _centroid_from_coords(coords):
-    pts = [c for c in coords if isinstance(c, (list, tuple)) and len(c) >= 2]
-    if not pts:
-        return None, None
-    lon = sum(p[0] for p in pts) / len(pts)
-    lat = sum(p[1] for p in pts) / len(pts)
-    return lat, lon
-
-def page_spatial_analysis() -> None:
-    components.page_header("Spatial Analysis", "Map point, line and polygon entities (rivers, roads, mountain ranges) within a scope.")
-    scoped_docs, _ = _project_document_scope("spatial")
-    if not scoped_docs:
-        st.info("No documents in this scope.")
-        return
-    doc_ids = [d["doc_id"] for d in scoped_docs]
-    ph = ", ".join("?" for _ in doc_ids)
-    with db.get_connection() as conn:
-        profile = get_active_profile(conn)
-        if not profile:
-            st.warning("Select a taxonomy profile.")
-            return
-        entities = conn.execute(f"""SELECT DISTINCT e.entity_id, e.canonical_name, e.latitude, e.longitude, e.geometry_type, e.geometry_json, c.name AS category_name
-            FROM entities e JOIN entity_categories c ON c.category_id = e.category_id
-            LEFT JOIN mentions m ON m.entity_id = e.entity_id AND m.deleted_at IS NULL
-            WHERE e.profile_id = ? AND e.deleted_at IS NULL AND (e.doc_id IN ({ph}) OR m.doc_id IN ({ph}))
-            ORDER BY e.canonical_name""", [profile["profile_id"]] + doc_ids + doc_ids).fetchall()
-    rows = [dict(e) for e in entities]
-    point_rows = [r for r in rows if r["latitude"] is not None and r["longitude"] is not None]
-    line_data, poly_data = [], []
-    for r in rows:
-        if not r["geometry_json"]:
-            continue
-        try:
-            g = json.loads(r["geometry_json"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if g["type"] in ("LineString",):
-            line_data.append({"path": g["coordinates"], "name": r["canonical_name"]})
-        elif g["type"] in ("MultiLineString",):
-            for seg in g["coordinates"]:
-                line_data.append({"path": seg, "name": r["canonical_name"]})
-        elif g["type"] == "Polygon":
-            poly_data.append({"polygon": g["coordinates"], "name": r["canonical_name"]})
-        elif g["type"] == "MultiPolygon":
-            for poly in g["coordinates"]:
-                poly_data.append({"polygon": poly, "name": r["canonical_name"]})
-    layers = []
-    if point_rows:
-        layers.append(pdk.Layer("ScatterplotLayer", data=point_rows, get_position=["longitude", "latitude"], get_radius=120, get_color=[36, 76, 86], pickable=True))
-    if line_data:
-        layers.append(pdk.Layer("PathLayer", data=line_data, get_path="path", get_color=[167, 137, 91], width_min_pixels=3))
-    if poly_data:
-        layers.append(pdk.Layer("PolygonLayer", data=poly_data, get_polygon="polygon", filled=True, get_fill_color=[36, 76, 86, 120], getLineColor=[229, 226, 219]))
-    if layers:
-        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=22.98, longitude=87.7, zoom=7, pitch=40)))
-    elif point_rows:
-        st.map(pd.DataFrame([{"lat": r["latitude"], "lon": r["longitude"]} for r in point_rows]), latitude="lat", longitude="lon")
-    else:
-        st.info("No georeferenced entities in this scope.")
-    st.divider()
-    with st.expander("🗺️ Add or edit entity geometry", expanded=True):
-        if not rows:
-            st.info("No entities in scope.")
-            return
-        opts = {f"{e['entity_id']} — {e['canonical_name']}": e for e in rows}
-        sel = st.selectbox("Entity", list(opts), key="spatial_entity")
-        entity = opts[sel]
-        gtype = st.selectbox("Geometry type", ["Point", "LineString", "Polygon", "MultiLineString", "MultiPolygon"], index=["Point","LineString","Polygon","MultiLineString","MultiPolygon"].index(entity["geometry_type"] or "Point"), key=f"gt_{entity['entity_id']}")
-        if gtype == "Point":
-            lat = st.number_input("Latitude", value=float(entity["latitude"] or 0.0), min_value=-90.0, max_value=90.0, format="%.6f")
-            lon = st.number_input("Longitude", value=float(entity["longitude"] or 0.0), min_value=-180.0, max_value=180.0, format="%.6f")
-            gj = json.dumps({"type": "Point", "coordinates": [lon, lat]})
-        else:
-            st.caption("Enter one [longitude, latitude] pair per line, e.g. `88.56, 22.33`.")
-            default = ""
-            if entity["geometry_json"]:
-                try:
-                    g = json.loads(entity["geometry_json"])
-                    coords = g["coordinates"][0] if g["type"].startswith("Multi") or g["type"] == "Polygon" else g["coordinates"]
-                    default = "\n".join(f"{c[0]}, {c[1]}" for c in coords if len(c) >= 2)
-                except Exception:
-                    default = ""
-            raw = st.text_area("Coordinates (lon, lat)", value=default, key=f"coords_{entity['entity_id']}", height=160)
-            pairs = []
-            for ln in raw.splitlines():
-                parts = ln.replace("[", "").replace("]", "").split(",")
-                if len(parts) >= 2:
-                    try:
-                        pairs.append([float(parts[0]), float(parts[1])])
-                    except ValueError:
-                        pass
-            if len(pairs) < 2:
-                st.error("Provide at least two coordinate pairs for a line/polygon.")
-                gj = None
-            else:
-                if gtype == "Polygon":
-                    if pairs[0] != pairs[-1]:
-                        pairs.append(pairs[0])
-                    gj = json.dumps({"type": "Polygon", "coordinates": [pairs]})
-                elif gtype == "LineString":
-                    gj = json.dumps({"type": "LineString", "coordinates": pairs})
-                else:
-                    gj = json.dumps({"type": gtype, "coordinates": [pairs]})
-                lat, lon = _centroid_from_coords(pairs)
-        if gj and st.button("Save geometry", type="primary", key=f"savegeo_{entity['entity_id']}"):
-            try:
-                lat_c, lon_c = _centroid_from_coords(json.loads(gj)["coordinates"][0] if gtype != "Point" and not gtype.startswith("Multi") else (json.loads(gj)["coordinates"]))
-            except Exception:
-                lat_c = lon_c = None
-            with db.get_connection() as conn:
-                db.set_entity_geometry(conn, entity["entity_id"], gtype, gj, lat_c, lon_c)
-            st.success("Geometry saved.")
-            safe_rerun()
-        if entity["geometry_json"] and st.button("Clear geometry", key=f"clrgeo_{entity['entity_id']}"):
-            with db.get_connection() as conn:
-                db.set_entity_geometry(conn, entity["entity_id"], "Point", None, None, None)
-            safe_rerun()
 
 def page_relationships() -> None:
     components.page_header("Relationship Management", "Researcher-controlled relationships, interpretations and evidence.")
@@ -1166,10 +1041,7 @@ def _candidate_phrase_options(passage_text: str, start: int, end: int) -> dict[s
     return spans
 
 def page_ai_review() -> None:
-    components.page_header(
-        "AI Candidate Review",
-        "Choose a suggested word or phrase, then accept, link, reject or defer it.",
-    )
+    components.page_header("AI Candidate Review", "Choose a suggested word or phrase, then accept, link, reject or defer it.")
     with db.get_connection() as conn:
         documents = db.list_documents(conn)
         profiles = db.get_profiles(conn)
@@ -1184,44 +1056,32 @@ def page_ai_review() -> None:
     selected_doc = st.selectbox("Document", list(doc_options), key="ai_review_doc_v2")
     doc_id = doc_options[selected_doc]
     category_map = {c["name"].lower(): c["category_id"] for c in categories}
-    
     if st.button("Run Entity Recognition", type="primary", key="run_ai_recognition_v2"):
         progress = st.progress(0.0, text="Preparing recognition...")
         try:
             with db.get_connection() as conn:
                 passages = db.get_passages(conn, doc_id)
             def progress_update(current, total):
-                progress.progress(
-                    current / total if total else 1.0,
-                    text=f"Scanning passage {current} of {total}",
-                )
-            found = ai_recognizer.recognize_candidates(
-                passages, category_map, entities, progress_callback=progress_update
-            )
+                progress.progress(current / total if total else 1.0, text=f"Scanning passage {current} of {total}")
+            found = ai_recognizer.recognize_candidates(passages, category_map, entities, progress_callback=progress_update)
             with db.get_connection() as conn:
                 count = db.bulk_save_candidates(conn, found)
             progress.empty()
             st.success(f"{count} candidate(s) added to the review queue.")
-            st.rerun()
+            safe_rerun()
         except Exception as exc:
             progress.empty()
             st.error(f"Recognition failed: {exc}")
-            
     with db.get_connection() as conn:
         total = db.count_candidates(conn, doc_id)
-        candidates = db.get_candidates_paginated(conn, doc_id, 100, 0)
+        candidates = rows_as_dicts(db.get_candidates_paginated(conn, doc_id, 100, 0))
         entities = db.get_entities(conn, profile_id)
     st.caption(f"{total} pending candidate(s).")
     if not candidates:
         st.info("No pending candidates in this document.")
         return
-        
     categories_by_name = {c["name"]: c["category_id"] for c in categories}
-    entity_options = {
-        f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"]
-        for e in entities
-    }
-    
+    entity_options = {f"{e['entity_id']} — {e['canonical_name']}": e["entity_id"] for e in entities}
     for candidate in candidates:
         with st.container(border=True):
             passage_text = candidate["passage_text"] or ""
@@ -1229,79 +1089,38 @@ def page_ai_review() -> None:
             suggestions = _candidate_phrase_options(passage_text, start, end)
             suggestion_labels = list(suggestions)
             st.markdown(f"**Recognition suggestion:** `{candidate['surface_form']}`")
-            st.caption(
-                f"Method: {candidate['recognition_method'] or 'unspecified'} · "
-                f"Confidence: {candidate['confidence_score']}"
-            )
+            st.caption(f"Method: {candidate['recognition_method'] or 'unspecified'} · Confidence: {candidate['confidence_score']}")
             if candidate.get("contextual_evidence"):
                 st.write(candidate["contextual_evidence"])
-                
-            selected_phrase = st.selectbox(
-                "Select a single word or phrase from the suggestions",
-                suggestion_labels,
-                index=(
-                    suggestion_labels.index(candidate["surface_form"])
-                    if candidate["surface_form"] in suggestion_labels else 0
-                ),
-                key=f"candidate_phrase_{candidate['candidate_id']}",
-            )
+            selected_phrase = st.selectbox("Select a single word or phrase from the suggestions", suggestion_labels, index=(suggestion_labels.index(candidate["surface_form"]) if candidate["surface_form"] in suggestion_labels else 0), key=f"candidate_phrase_{candidate['candidate_id']}")
             phrase_start, phrase_end = suggestions[selected_phrase]
             context_start = max(0, phrase_start - 80)
             context_end = min(len(passage_text), phrase_end + 80)
             st.text(passage_text[context_start:context_end])
-            
             suggested_category = candidate.get("suggested_category_name")
             category_names = list(categories_by_name)
             if not category_names:
                 st.warning("No categories exist in the taxonomy.")
                 continue
-                
-            category_index = (
-                category_names.index(suggested_category)
-                if suggested_category in category_names else 0
-            )
-            category = st.selectbox(
-                "Category",
-                category_names,
-                index=category_index,
-                key=f"candidate_category_v2_{candidate['candidate_id']}",
-            )
-            decision = st.radio(
-                "Decision",
-                ["Link to existing entity", "Create new entity", "Reject", "Defer"],
-                horizontal=True,
-                key=f"candidate_decision_{candidate['candidate_id']}",
-            )
+            category_index = category_names.index(suggested_category) if suggested_category in category_names else 0
+            category = st.selectbox("Category", category_names, index=category_index, key=f"candidate_category_v2_{candidate['candidate_id']}")
+            decision = st.radio("Decision", ["Link to existing entity", "Create new entity", "Reject", "Defer"], horizontal=True, key=f"candidate_decision_{candidate['candidate_id']}")
             linked_entity = None
             new_name = selected_phrase
-            
             if decision == "Link to existing entity":
                 if entity_options:
-                    linked_entity = st.selectbox(
-                        "Existing entity",
-                        list(entity_options),
-                        key=f"candidate_link_entity_{candidate['candidate_id']}",
-                    )
+                    linked_entity = st.selectbox("Existing entity", list(entity_options), key=f"candidate_link_entity_{candidate['candidate_id']}")
                 else:
                     st.info("No existing entity. Choose Create new entity.")
             elif decision == "Create new entity":
-                new_name = st.text_input(
-                    "Canonical entity name",
-                    value=selected_phrase,
-                    key=f"candidate_canonical_{candidate['candidate_id']}",
-                )
-                
-            if st.button(
-                "Apply researcher decision",
-                type="primary",
-                key=f"candidate_apply_v2_{candidate['candidate_id']}",
-            ):
+                new_name = st.text_input("Canonical entity name", value=selected_phrase, key=f"candidate_canonical_{candidate['candidate_id']}")
+            if st.button("Apply researcher decision", type="primary", key=f"candidate_apply_v2_{candidate['candidate_id']}"):
                 if decision == "Defer":
                     st.info("Candidate remains pending.")
                 elif decision == "Reject":
                     with db.get_connection() as conn:
                         db.update_candidate_status(conn, candidate["candidate_id"], "rejected")
-                    st.rerun()
+                    safe_rerun()
                 elif decision == "Link to existing entity" and not linked_entity:
                     st.error("Select an existing entity or choose Create new entity.")
                 elif decision == "Create new entity" and not new_name.strip():
@@ -1313,29 +1132,11 @@ def page_ai_review() -> None:
                                 entity_id = entity_options[linked_entity]
                             else:
                                 entity_id = db.next_entity_id(conn)
-                                conn.execute(
-                                    """INSERT INTO entities
-                                    (entity_id, profile_id, canonical_name, category_id, created_at)
-                                    VALUES (?, ?, ?, ?, ?)""",
-                                    (
-                                        entity_id, profile_id, new_name.strip(),
-                                        categories_by_name[category], db.utc_now(),
-                                    ),
-                                )
-                            db.save_mention(
-                                conn,
-                                entity_id=entity_id,
-                                doc_id=doc_id,
-                                passage_id=candidate["passage_id"],
-                                surface_form=selected_phrase,
-                                char_start=phrase_start,
-                                char_end=phrase_end,
-                            )
-                            db.update_candidate_status(
-                                conn, candidate["candidate_id"], "accepted"
-                            )
+                                conn.execute("INSERT INTO entities (entity_id, profile_id, canonical_name, category_id, created_at) VALUES (?, ?, ?, ?, ?)", (entity_id, profile_id, new_name.strip(), categories_by_name[category], db.utc_now()))
+                            db.save_mention(conn, entity_id=entity_id, doc_id=doc_id, passage_id=candidate["passage_id"], surface_form=selected_phrase, char_start=phrase_start, char_end=phrase_end)
+                            db.update_candidate_status(conn, candidate["candidate_id"], "accepted")
                         st.success("Selected phrase has been annotated.")
-                        st.rerun()
+                        safe_rerun()
                     except Exception as exc:
                         st.error(f"Could not save this annotation: {exc}")
 
@@ -1345,9 +1146,7 @@ def page_trash() -> None:
         documents = db.list_documents(conn, include_deleted=True)
         deleted_docs = [d for d in documents if d["deleted_at"] is not None]
         deleted_entities = conn.execute("SELECT * FROM entities WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC").fetchall()
-        deleted_rels = conn.execute("""SELECT r.relationship_id, r.deleted_at, s.canonical_name AS sn, t.canonical_name AS tn, rt.name AS type_name, r.doc_id
-            FROM relationships r JOIN entities s ON s.entity_id=r.source_entity_id JOIN entities t ON t.entity_id=r.target_entity_id JOIN relationship_types rt ON rt.type_id=r.type_id
-            WHERE r.deleted_at IS NOT NULL ORDER BY r.deleted_at DESC""").fetchall()
+        deleted_rels = conn.execute("SELECT r.relationship_id, r.deleted_at, s.canonical_name AS sn, t.canonical_name AS tn, rt.name AS type_name, r.doc_id FROM relationships r JOIN entities s ON s.entity_id=r.source_entity_id JOIN entities t ON t.entity_id=r.target_entity_id JOIN relationship_types rt ON rt.type_id=r.type_id WHERE r.deleted_at IS NOT NULL ORDER BY r.deleted_at DESC").fetchall()
         deleted_profs = db.list_profiles(conn, include_deleted=True)
         deleted_profs = [p for p in deleted_profs if p["deleted_at"] is not None]
     if not deleted_docs and not deleted_entities and not deleted_rels and not deleted_profs:
@@ -1457,33 +1256,6 @@ def page_export() -> None:
             except Exception as exc:
                 st.error(f"Spatial export failed: {exc}")
 
-def page_network_analysis() -> None:
-    components.page_header("Network Analysis", "Explore researcher-defined entity relationships by document, corpus, project or across the active collection.")
-    scoped_docs, _ = _project_document_scope("network")
-    if not scoped_docs:
-        st.info("No documents in this scope.")
-        return
-    doc_ids = [d["doc_id"] for d in scoped_docs]
-    placeholders = ",".join("?" for _ in doc_ids)
-    with db.get_connection() as conn:
-        relations = conn.execute(f"""SELECT r.relationship_id, r.source_entity_id, r.target_entity_id, s.canonical_name AS source_name, t.canonical_name AS target_name, rt.name AS type_name, r.description, r.doc_id
-            FROM relationships r JOIN entities s ON s.entity_id = r.source_entity_id JOIN entities t ON t.entity_id = r.target_entity_id JOIN relationship_types rt ON rt.type_id = r.type_id
-            WHERE r.deleted_at IS NULL AND (r.doc_id IN ({placeholders}) OR r.doc_id IS NULL) ORDER BY r.created_at""", doc_ids).fetchall()
-    if not relations:
-        st.info("No relationships found in this scope.")
-        return
-    from streamlit_agraph import agraph, Node, Edge, Config
-    nodes, edges = {}, []
-    for relation in relations:
-        source_id, target_id = relation["source_entity_id"], relation["target_entity_id"]
-        nodes.setdefault(source_id, Node(id=source_id, label=relation["source_name"], size=22, color="#244C56"))
-        nodes.setdefault(target_id, Node(id=target_id, label=relation["target_name"], size=22, color="#A7895B"))
-        edges.append(Edge(source=source_id, target=target_id, label=relation["type_name"], color="#E5E2DB"))
-    st.caption(f"{len(scoped_docs)} document(s) · {len(nodes)} entities · {len(edges)} relationship records")
-    agraph(nodes=list(nodes.values()), edges=edges, config=Config(width="100%", height=650, directed=True, physics=True, hierarchical=False, nodeHighlightBehavior=True, highlightColor="#F7A7A6", collapsible=False))
-    with st.expander("Relationship data"):
-        st.dataframe(pd.DataFrame(rows_as_dicts(relations)), hide_index=True, width="stretch")
-
 def page_taxonomy_manager() -> None:
     components.page_header("Taxonomy Manager", "Manage taxonomy profiles, entity categories, relationship types and metadata.")
     with db.get_connection() as conn:
@@ -1586,9 +1358,9 @@ def page_taxonomy_manager() -> None:
         payload = {"format": "TextEncodeTaxonomy", "version": 1, "profile": prof, "categories": cats, "relationship_types": rts, "attribute_definitions": ats}
         st.download_button("Download taxonomy JSON", data=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), file_name=f"textencode_taxonomy_{profile_id}.json", mime="application/json")
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # NAVIGATION
-# ---------------------------------------------------------------------
+# =====================================================================
 navigation = st.navigation({
     "Workspace": [
         st.Page(page_dashboard, title="Dashboard", icon=":material/dashboard:", default=True),
