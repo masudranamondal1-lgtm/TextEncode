@@ -122,6 +122,40 @@ def init_db(db_path: str | Path | None = None) -> None:
             CREATE TABLE IF NOT EXISTS evidence_bundles (evidence_id INTEGER PRIMARY KEY AUTOINCREMENT, relationship_id TEXT NOT NULL REFERENCES relationships(relationship_id) ON DELETE CASCADE, evidence_domain TEXT NOT NULL, source_text TEXT NOT NULL, context TEXT, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS entity_candidates (candidate_id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE, passage_id TEXT NOT NULL REFERENCES passages(passage_id) ON DELETE CASCADE, surface_form TEXT NOT NULL, char_start INTEGER NOT NULL, char_end INTEGER NOT NULL, suggested_category_id INTEGER REFERENCES entity_categories(category_id), confidence_score REAL DEFAULT 0.0, recognition_method TEXT, contextual_evidence TEXT, review_status TEXT DEFAULT 'pending', created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS audit_log (log_id INTEGER PRIMARY KEY AUTOINCREMENT, record_type TEXT NOT NULL, record_id TEXT NOT NULL, operation TEXT NOT NULL, old_value TEXT, new_value TEXT, timestamp TEXT NOT NULL, origin TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS external_authorities (
+    authority_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    provider_name TEXT NOT NULL UNIQUE, 
+    namespace TEXT NOT NULL, 
+    base_uri TEXT, 
+    enabled INTEGER DEFAULT 1, 
+    attribution TEXT, 
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_identifiers (
+    identifier_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    entity_id TEXT NOT NULL REFERENCES entities(entity_id) ON DELETE CASCADE, 
+    authority_id INTEGER NOT NULL REFERENCES external_authorities(authority_id), 
+    external_identifier TEXT NOT NULL, 
+    external_uri TEXT, 
+    external_label TEXT, 
+    match_status TEXT DEFAULT 'accepted', 
+    researcher_note TEXT, 
+    accepted_at TEXT,
+    UNIQUE(entity_id, authority_id, external_identifier)
+);
+CREATE TABLE IF NOT EXISTS reconciliation_candidates (
+    candidate_id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    entity_id TEXT NOT NULL REFERENCES entities(entity_id) ON DELETE CASCADE, 
+    authority_id INTEGER NOT NULL REFERENCES external_authorities(authority_id), 
+    external_identifier TEXT NOT NULL, 
+    external_uri TEXT, 
+    external_label TEXT, 
+    external_description TEXT, 
+    alternative_names TEXT, 
+    search_query TEXT, 
+    review_status TEXT DEFAULT 'suggested', 
+    created_at TEXT NOT NULL
+);
         """)
         
         def add_col(table, col, definition):
@@ -743,3 +777,84 @@ def soft_delete_evidence(conn, evidence_id: int) -> None:
 
 def delete_evidence_bundle(conn, evidence_id: int) -> None:
     conn.execute("DELETE FROM evidence_bundles WHERE evidence_id=?", (evidence_id,))
+
+    # =====================================================================
+# PHASE 4: LINKED DATA AND EXTERNAL AUTHORITY RECONCILIATION
+# =====================================================================
+
+def init_external_authorities(conn) -> None:
+    """Seed default authorities if the table is empty."""
+    count = conn.execute("SELECT COUNT(*) FROM external_authorities").fetchone()[0]
+    if count == 0:
+        conn.execute("""
+            INSERT INTO external_authorities (provider_name, namespace, base_uri, enabled, attribution)
+            VALUES 
+            ('Wikidata', 'wikidata', 'http://www.wikidata.org/entity/', 1, 'Wikidata is a free and open knowledge base.'),
+            ('GeoNames', 'geonames', 'http://sws.geonames.org/', 1, 'GeoNames is a geographical database.')
+        """)
+
+def get_enabled_authorities(conn) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM external_authorities WHERE enabled = 1").fetchall()
+
+def add_entity_identifier(conn, entity_id: str, authority_id: int, external_identifier: str, 
+                          external_uri: str, external_label: str, match_status: str = "accepted", 
+                          researcher_note: str = "") -> int:
+    """Link an entity to an external identifier. Prevents exact duplicates."""
+    existing = conn.execute(
+        "SELECT identifier_id FROM entity_identifiers WHERE entity_id=? AND authority_id=? AND external_identifier=?",
+        (entity_id, authority_id, external_identifier)
+    ).fetchone()
+    if existing:
+        return existing["identifier_id"]
+    
+    conn.execute("""
+        INSERT INTO entity_identifiers (entity_id, authority_id, external_identifier, external_uri, 
+                                        external_label, match_status, researcher_note, accepted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (entity_id, authority_id, external_identifier, external_uri, external_label, match_status, researcher_note, utc_now()))
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+def remove_entity_identifier(conn, identifier_id: int) -> None:
+    conn.execute("DELETE FROM entity_identifiers WHERE identifier_id = ?", (identifier_id,))
+
+def get_external_identifiers(conn, entity_id: str) -> list[sqlite3.Row]:
+    return conn.execute("""
+        SELECT ei.*, ea.provider_name, ea.namespace 
+        FROM entity_identifiers ei 
+        JOIN external_authorities ea ON ei.authority_id = ea.authority_id 
+        WHERE ei.entity_id = ?
+    """, (entity_id,)).fetchall()
+
+def save_reconciliation_candidates(conn, entity_id: str, authority_id: int, candidates: list[dict], search_query: str) -> int:
+    """Save search results as candidates. Returns count of new candidates."""
+    count = 0
+    for c in candidates:
+        existing = conn.execute(
+            "SELECT candidate_id FROM reconciliation_candidates WHERE entity_id=? AND external_identifier=? AND review_status='suggested'",
+            (entity_id, c["external_identifier"])
+        ).fetchone()
+        if not existing:
+            conn.execute("""
+                INSERT INTO reconciliation_candidates (entity_id, authority_id, external_identifier, external_uri, 
+                                                       external_label, external_description, alternative_names, 
+                                                       search_query, review_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'suggested', ?)
+            """, (entity_id, authority_id, c["external_identifier"], c["external_uri"], c["external_label"], 
+                  c.get("external_description", ""), c.get("alternative_names", ""), search_query, utc_now()))
+            count += 1
+    return count
+
+def get_candidates_for_entity(conn, entity_id: str, review_status: str = "suggested") -> list[sqlite3.Row]:
+    return conn.execute("""
+        SELECT rc.*, ea.provider_name 
+        FROM reconciliation_candidates rc 
+        JOIN external_authorities ea ON rc.authority_id = ea.authority_id 
+        WHERE rc.entity_id = ? AND rc.review_status = ?
+        ORDER BY rc.created_at DESC
+    """, (entity_id, review_status)).fetchall()
+
+def update_reconciliation_candidate_status(conn, candidate_id: int, status: str) -> None:
+    allowed = {"accepted", "rejected", "deferred", "superseded"}
+    if status not in allowed:
+        raise ValueError(f"Invalid status: {status}")
+    conn.execute("UPDATE reconciliation_candidates SET review_status = ? WHERE candidate_id = ?", (status, candidate_id))

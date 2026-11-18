@@ -13,6 +13,12 @@ def generate_json_export(conn) -> str:
     for name, query in tables.items():
         rows = conn.execute(query).fetchall()
         data[name] = [dict(row) for row in rows]
+            # Add external identifiers
+    id_rows = conn.execute("""
+        SELECT ei.*, ea.provider_name FROM entity_identifiers ei 
+        JOIN external_authorities ea ON ei.authority_id = ea.authority_id
+    """).fetchall()
+    data["entity_identifiers"] = [dict(row) for row in id_rows]
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 def generate_gephi_data(conn, doc_id: str | None = None) -> tuple[bytes, bytes, bytes]:
@@ -35,10 +41,27 @@ def generate_gephi_data(conn, doc_id: str | None = None) -> tuple[bytes, bytes, 
     return gexf_buffer.getvalue(), nodes_df.to_csv(index=False).encode("utf-8-sig"), edges_df.to_csv(index=False).encode("utf-8-sig")
 
 def generate_qgis_geojson(conn) -> str:
-    rows = conn.execute("SELECT entity_id, canonical_name, latitude, longitude, category_id FROM entities WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND deleted_at IS NULL").fetchall()
+    rows = conn.execute("""
+        SELECT e.entity_id, e.canonical_name, e.latitude, e.longitude, e.category_id,
+               GROUP_CONCAT(ei.external_uri, ',') as external_uris
+        FROM entities e 
+        LEFT JOIN entity_identifiers ei ON e.entity_id = ei.entity_id AND ei.match_status = 'accepted'
+        WHERE e.latitude IS NOT NULL AND e.longitude IS NOT NULL AND e.deleted_at IS NULL 
+        GROUP BY e.entity_id
+    """).fetchall()
     features = []
     for r in rows:
-        features.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [r["longitude"], r["latitude"]]}, "properties": {"entity_id": r["entity_id"], "name": r["canonical_name"], "category_id": r["category_id"]}})
+        props = {
+            "entity_id": r["entity_id"], 
+            "name": r["canonical_name"], 
+            "category_id": r["category_id"],
+            "external_uris": r["external_uris"] or ""
+        }
+        features.append({
+            "type": "Feature", 
+            "geometry": {"type": "Point", "coordinates": [r["longitude"], r["latitude"]]}, 
+            "properties": props
+        })
     return json.dumps({"type": "FeatureCollection", "features": features}, ensure_ascii=False, indent=2)
 
 def generate_tei_xml(conn, doc_id: str) -> str:
